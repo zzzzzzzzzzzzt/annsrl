@@ -66,4 +66,4 @@ class SessionBaseline(BaselineInterface):
         return mean_reward.item()
 
     def get(self, session_index, query_index, device='cpu', **kwargs):
-        return self.baseline[query_index[session_index]].to(device=device)
+        return self.baseline.to(device=device)[query_index.to(device=device)[session_index]]
