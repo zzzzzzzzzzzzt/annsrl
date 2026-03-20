@@ -274,6 +274,168 @@ class TRPO(BaseAlgorithm):
         return mean_reward
 
 
+class PPO(BaseAlgorithm):
+    """ Proximal Policy Optimization.
+        Replaces TRPO's conjugate gradient / Fisher matrix with a clipped surrogate objective,
+        enabling multiple mini-batch gradient steps per session batch.
+    """
+
+    def __init__(self, agent, hnsw, reward, baseline,
+                 optimizer=None, lr=3e-4,
+                 clip_eps=0.2, ppo_epochs=4, samples_in_batch=4096,
+                 entropy_reg=0.01, **kwargs):
+        """
+        :param clip_eps: PPO clipping epsilon
+        :param ppo_epochs: number of gradient update passes over each session batch
+        :param samples_in_batch: mini-batch size for each gradient step
+        :param entropy_reg: entropy bonus coefficient
+        :param optimizer: optional pre-built optimizer; if None, Adam with lr is used
+        """
+        super().__init__(agent, hnsw, reward, baseline, **kwargs)
+        self.clip_eps = clip_eps
+        self.ppo_epochs = ppo_epochs
+        self.samples_in_batch = samples_in_batch
+        self.entropy_reg = entropy_reg
+        self.optimizer = optimizer or torch.optim.Adam(agent.parameters(), lr=lr)
+
+    def train_on_batch(self, state, from_vertex_ids, to_vertex_ids, actions, rewards, session_index, **kwargs):
+        baseline = self.baseline.get(state=state, from_vertex_ids=from_vertex_ids, to_vertex_ids=to_vertex_ids,
+                                     rewards=rewards, session_index=session_index, device=self.device, **kwargs)
+        mean_reward = self.baseline.update(state=state, from_vertex_ids=from_vertex_ids, to_vertex_ids=to_vertex_ids,
+                                           rewards=rewards, session_index=session_index, device=self.device, **kwargs)
+
+        advantage = (rewards - baseline).detach()
+
+        # Compute old log-probs once (no grad)
+        with torch.no_grad():
+            old_logp = self.agent.get_edge_logp(from_vertex_ids, to_vertex_ids,
+                                                state=state, device=self.device)
+            old_logp_action = torch.gather(old_logp, dim=-1, index=actions[:, None])[:, 0]
+
+        n = len(from_vertex_ids)
+        total_loss = total_ent = total_kl = 0.0
+        n_updates = 0
+
+        for _ in range(self.ppo_epochs):
+            perm = torch.randperm(n, device=self.device)
+            for start in range(0, n, self.samples_in_batch):
+                idx = perm[start:start + self.samples_in_batch]
+
+                logp = self.agent.get_edge_logp(from_vertex_ids[idx], to_vertex_ids[idx],
+                                                state=state, device=self.device)
+                logp_action = torch.gather(logp, dim=-1, index=actions[idx, None])[:, 0]
+
+                ratio = torch.exp(logp_action - old_logp_action[idx])
+                adv = advantage[idx]
+
+                surr1 = ratio * adv
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                ent = (-logp.exp() * logp).sum(-1).mean()
+                loss = policy_loss - self.entropy_reg * ent
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                with torch.no_grad():
+                    kl = (old_logp[idx].exp() * (old_logp[idx] - logp.detach())).sum(-1).mean()
+
+                total_loss += loss.item()
+                total_ent += ent.item()
+                total_kl += kl.item()
+                n_updates += 1
+
+        self.writer.add_scalar('train/loss', total_loss / n_updates, global_step=self.step)
+        self.writer.add_scalar('train/entropy', total_ent / n_updates, global_step=self.step)
+        self.writer.add_scalar('train/kl', total_kl / n_updates, global_step=self.step)
+        self.writer.add_scalar('train/baseline', baseline.mean().item(), global_step=self.step)
+        self.writer.add_scalar('train/advantage', advantage.mean().item(), global_step=self.step)
+        return mean_reward
+
+
+class MemoryEfficientPPO(PPO):
+    """ PPO with reduced GPU memory footprint.
+        Key differences from PPO:
+        - old_logp computed in chunks and stored on CPU
+        - advantage normalized per batch
+        - torch.cuda.empty_cache() called after each mini-batch
+    """
+
+    def train_on_batch(self, state, from_vertex_ids, to_vertex_ids, actions, rewards, session_index, **kwargs):
+        baseline = self.baseline.get(state=state, from_vertex_ids=from_vertex_ids, to_vertex_ids=to_vertex_ids,
+                                     rewards=rewards, session_index=session_index, device=self.device, **kwargs)
+        mean_reward = self.baseline.update(state=state, from_vertex_ids=from_vertex_ids, to_vertex_ids=to_vertex_ids,
+                                           rewards=rewards, session_index=session_index, device=self.device, **kwargs)
+
+        advantage = (rewards - baseline).detach()
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
+        n = len(from_vertex_ids)
+
+        # Keep ids on CPU for state.vertices indexing (state may be on a different device)
+        from_vertex_ids_cpu = from_vertex_ids.cpu()
+        to_vertex_ids_cpu = to_vertex_ids.cpu()
+        actions_cpu = actions.cpu()
+
+        # Compute old log-probs in chunks on CPU to avoid holding full tensor on GPU
+        old_logp_cpu = torch.empty(n, 2, dtype=torch.float32)
+        old_logp_action_cpu = torch.empty(n, dtype=torch.float32)
+        with torch.no_grad():
+            for s in range(0, n, self.samples_in_batch):
+                e = min(s + self.samples_in_batch, n)
+                chunk = self.agent.get_edge_logp(
+                    from_vertex_ids_cpu[s:e], to_vertex_ids_cpu[s:e],
+                    state=state, device=self.device).cpu()
+                old_logp_cpu[s:e] = chunk
+                old_logp_action_cpu[s:e] = torch.gather(
+                    chunk, dim=-1, index=actions_cpu[s:e, None])[:, 0]
+        torch.cuda.empty_cache()
+
+        total_loss = total_ent = total_kl = 0.0
+        n_updates = 0
+
+        for _ in range(self.ppo_epochs):
+            perm = torch.randperm(n)
+            for s in range(0, n, self.samples_in_batch):
+                idx = perm[s:s + self.samples_in_batch]
+
+                logp = self.agent.get_edge_logp(from_vertex_ids_cpu[idx], to_vertex_ids_cpu[idx],
+                                                state=state, device=self.device)
+                logp_action = torch.gather(logp, dim=-1, index=actions_cpu[idx, None].to(self.device))[:, 0]
+
+                old_lpa = old_logp_action_cpu[idx].to(self.device)
+                ratio = torch.exp(logp_action - old_lpa)
+                adv = advantage[idx.to(self.device)]
+
+                surr = torch.min(ratio * adv,
+                                 torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv)
+                ent = (-logp.exp() * logp).sum(-1).mean()
+                loss = -surr.mean() - self.entropy_reg * ent
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                with torch.no_grad():
+                    old_lp = old_logp_cpu[idx].to(self.device)
+                    kl = (old_lp.exp() * (old_lp - logp.detach())).sum(-1).mean()
+
+                total_loss += loss.item()
+                total_ent += ent.item()
+                total_kl += kl.item()
+                n_updates += 1
+                torch.cuda.empty_cache()
+
+        self.writer.add_scalar('train/loss', total_loss / n_updates, global_step=self.step)
+        self.writer.add_scalar('train/entropy', total_ent / n_updates, global_step=self.step)
+        self.writer.add_scalar('train/kl', total_kl / n_updates, global_step=self.step)
+        self.writer.add_scalar('train/baseline', baseline.mean().item(), global_step=self.step)
+        self.writer.add_scalar('train/advantage', advantage.mean().item(), global_step=self.step)
+        return mean_reward
+
+
 class EfficientTRPO(TRPO):
     """ Optimized Trust Region Policy Optimization """
 

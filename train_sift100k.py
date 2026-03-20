@@ -80,7 +80,7 @@ entropy_reg = 0.01        # coefficient in front of the entropy regularizer term
 batch_size = 100000       # number of sessions per batch
 
 n_jobs = 8                # Number of threads for C++ sampling
-max_steps = 1000          # Max number of training iterations
+max_steps = 150          # Max number of training iterations
 
 # Recover settings
 restore_step = None       # the iteration step from which you want to recover the model 
