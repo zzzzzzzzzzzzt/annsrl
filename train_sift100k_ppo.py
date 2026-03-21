@@ -63,7 +63,7 @@ hidden_size = 2048        # number of hidden units
 # Algorithm params #
 ####################
 
-samples_in_batch = 85000   # PPO mini-batch size per gradient step
+samples_in_batch = 4096   # PPO mini-batch size per gradient step
 ppo_epochs = 4            # number of gradient passes over each session batch
 lr = 3e-4                 # Adam learning rate
 clip_eps = 0.2            # PPO clipping epsilon
@@ -77,9 +77,6 @@ update_edges_every = 10   # call hnsw.update_edges() every N steps
 
 n_jobs = 8                # Number of threads for C++ sampling
 max_steps = 1000          # Max number of training iterations
-
-sample_device = 'cuda:0'  # device for edge scoring in prepare_edges_with_probs
-train_device  = 'cuda:1'  # device for PPO gradient updates
 
 # Recover settings
 restore_step = None       # the iteration step from which you want to recover the model 
@@ -139,13 +136,13 @@ else:
     baseline = lib.SessionBaseline(graph.train_queries.size(0))
     
 reward = lib.MaxDCSReward(k=k, max_dcs=max_dcs)
-trainer = lib.PPO(agent, hnsw, reward, baseline,
+trainer = lib.OptimizedPPO(agent, hnsw, reward, baseline,
                   lr=lr,
                   clip_eps=clip_eps,
                   ppo_epochs=ppo_epochs,
                   samples_in_batch=samples_in_batch,
                   entropy_reg=entropy_reg,
-                  device=train_device,
+                  target_kl=0.015,                   # 加入早停保障
                   writer=SummaryWriter('./runs/' + exp_name))
 
 if restore_step is not None:
@@ -175,13 +172,12 @@ dev_iterator = lib.utils.iterate_minibatches(graph.test_queries, graph.test_gt,
 for batch_queries, batch_gt, batch_query_ids in train_batcher:
     start = time.time()
     torch.cuda.empty_cache()
-    mean_reward = trainer.train_step(batch_queries, batch_gt, query_index=batch_query_ids,
-                                     sample_device=sample_device)
+    mean_reward = trainer.train_step(batch_queries, batch_gt, query_index=batch_query_ids)
     reward_history.append(mean_reward)
 
-    if trainer.step % update_edges_every == 0:
-        promoted = hnsw.update_edges()
-        trainer.writer.add_scalar('train/promoted_edges', promoted, global_step=trainer.step)
+    # if trainer.step % update_edges_every == 0:
+    #     promoted = hnsw.update_edges()
+    #     trainer.writer.add_scalar('train/promoted_edges', promoted, global_step=trainer.step)
         
     if trainer.step % 10 == 0:
         val_reward = trainer.evaluate(*next(val_iterator), prefix='val')
@@ -221,7 +217,7 @@ trainer.step = best_val_step
 from collections import defaultdict
 
 agent.cuda()
-state = agent.prepare_state(graph, device=sample_device)
+state = agent.prepare_state(graph, device='cuda')
 
 new_edges = defaultdict(list)
 
@@ -232,7 +228,7 @@ for i in range(len(hnsw.from_vertex_ids)):
 
     with torch.no_grad():
         edges_logp = agent.get_edge_logp(from_vertex_ids, to_vertex_ids,
-                                        state=state, device=sample_device).cpu()
+                                        state=state, device='cuda').cpu()
         edges_mask = edges_logp.argmax(-1).numpy() == 1
         edges_mask = edges_mask | (edge_confidence == hnsw.edge_patience)
         edges_mask = edges_mask & (edge_confidence != -hnsw.edge_patience)
@@ -256,7 +252,7 @@ for heap_size in range(12, 121, 4):
     algo_hnsw = lib.BaseAlgorithm(
         agent=agent, hnsw=hnsw,
         reward=lambda actions, **kw: [0] * len(actions),
-        writer=trainer.writer, device=sample_device,
+        writer=trainer.writer, device='cuda',
     )
     algo_hnsw.hnsw.ef = heap_size
     algo_hnsw.step = trainer.step  # for tensorboard

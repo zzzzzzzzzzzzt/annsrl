@@ -354,7 +354,136 @@ class PPO(BaseAlgorithm):
         self.writer.add_scalar('train/advantage', advantage.mean().item(), global_step=self.step)
         return mean_reward
 
+class OptimizedPPO(BaseAlgorithm):
+    """ 
+    Optimized Proximal Policy Optimization.
+    引入了样本聚合去重，并修复了全量前向传播导致的 OOM 问题。
+    """
 
+    def __init__(self, agent, hnsw, reward, baseline,
+                 optimizer=None, lr=3e-4,
+                 clip_eps=0.2, ppo_epochs=4, samples_in_batch=40000,
+                 entropy_reg=0.01, target_kl=0.015, **kwargs):
+        super().__init__(agent, hnsw, reward, baseline, **kwargs)
+        self.clip_eps = clip_eps
+        self.ppo_epochs = ppo_epochs
+        # 建议稍微调小一点，比如 40000，防止反向传播时的隐层矩阵过大 OOM
+        self.samples_in_batch = samples_in_batch 
+        self.entropy_reg = entropy_reg
+        self.target_kl = target_kl
+        self.optimizer = optimizer or torch.optim.Adam(agent.parameters(), lr=lr)
+
+    def train_on_batch(self, state, from_vertex_ids, to_vertex_ids, actions, rewards, session_index, **kwargs):
+        # 1. 获取 Baseline 并计算 Advantage
+        baseline = self.baseline.get(state=state, from_vertex_ids=from_vertex_ids, to_vertex_ids=to_vertex_ids,
+                                     rewards=rewards, session_index=session_index, device=self.device, **kwargs)
+        mean_reward = self.baseline.update(state=state, from_vertex_ids=from_vertex_ids, to_vertex_ids=to_vertex_ids,
+                                           rewards=rewards, session_index=session_index, device=self.device, **kwargs)
+
+        advantage = (rewards - baseline).detach()
+        adv_mean_log = advantage.mean().item()
+
+        # 2. Advantage 归一化 (Standardization)
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
+        # 3. 核心优化：样本聚合去重 (Sample Aggregation)
+        from_vertex_ids, to_vertex_ids, actions, advantage, freqs = \
+            self.aggregate_samples(from_vertex_ids, to_vertex_ids, actions, advantage, device=self.device)
+
+        n_unique = len(from_vertex_ids)
+
+        # 4. 【修复 OOM 的关键】分块计算 old_logp，避免一次性生成 25GB 的巨型张量
+        old_logp_list = []
+        old_logp_action_list =[]
+        with torch.no_grad():
+            for start in range(0, n_unique, self.samples_in_batch):
+                end = min(start + self.samples_in_batch, n_unique)
+                
+                # 仅对一小块数据做前向传播
+                chunk_logp = self.agent.get_edge_logp(
+                    from_vertex_ids[start:end], 
+                    to_vertex_ids[start:end],
+                    state=state, device=self.device
+                )
+                chunk_action = actions[start:end]
+                
+                old_logp_list.append(chunk_logp)
+                old_logp_action_list.append(torch.gather(chunk_logp, dim=-1, index=chunk_action[:, None])[:, 0])
+
+        # 将分块计算的结果拼接起来 (拼接后的张量极小，不会爆显存)
+        old_logp = torch.cat(old_logp_list, dim=0)
+        old_logp_action = torch.cat(old_logp_action_list, dim=0)
+
+        total_loss = total_ent = total_kl = 0.0
+        n_updates = 0
+
+        # 5. PPO 多轮迭代 (Epochs)
+        for epoch in range(self.ppo_epochs):
+            perm = torch.randperm(n_unique, device=self.device)
+            epoch_kl = 0.0
+
+            for start in range(0, n_unique, self.samples_in_batch):
+                idx = perm[start:start + self.samples_in_batch]
+                
+                batch_freqs = freqs[idx]
+                freqs_sum = batch_freqs.sum()
+
+                # 前向传播 (此时天然是被 samples_in_batch 分块的，安全)
+                logp = self.agent.get_edge_logp(from_vertex_ids[idx], to_vertex_ids[idx],
+                                                state=state, device=self.device)
+                logp_action = torch.gather(logp, dim=-1, index=actions[idx, None])[:, 0]
+
+                # 计算 Importance Sampling Ratio
+                ratio = torch.exp(logp_action - old_logp_action[idx])
+                adv = advantage[idx]
+
+                # Surrogate Loss
+                surr1 = ratio * adv
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
+                policy_loss = -(torch.min(surr1, surr2) * batch_freqs).sum() / freqs_sum
+
+                # Entropy Regularization
+                ent = (-logp.exp() * logp).sum(-1)
+                ent_loss = (ent * batch_freqs).sum() / freqs_sum
+                
+                loss = policy_loss - self.entropy_reg * ent_loss
+
+                # 反向传播与优化
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                # 计算 KL 散度
+                with torch.no_grad():
+                    old_lp = old_logp[idx]
+                    kl = (batch_freqs * (old_lp.exp() * (old_lp - logp.detach())).sum(-1)).sum() / freqs_sum
+
+                total_loss += loss.item()
+                total_ent += ent_loss.item()
+                total_kl += kl.item()
+                
+                # 按频次加权统计 epoch 的总 KL
+                epoch_kl += kl.item() * (freqs_sum.item() / freqs.sum().item())
+                n_updates += 1
+
+            # 6. KL 早停机制 (Early Stopping)
+            if self.target_kl is not None and epoch_kl > 1.5 * self.target_kl:
+                # 可以在这里加个 print 观察是否触发早停
+                # print(f"KL early stopping triggered at epoch {epoch}")
+                break
+
+        # 写日志
+        if n_updates > 0:
+            self.writer.add_scalar('train/loss', total_loss / n_updates, global_step=self.step)
+            self.writer.add_scalar('train/entropy', total_ent / n_updates, global_step=self.step)
+            self.writer.add_scalar('train/kl', total_kl / n_updates, global_step=self.step)
+            
+        self.writer.add_scalar('train/baseline', baseline.mean().item(), global_step=self.step)
+        self.writer.add_scalar('train/advantage', adv_mean_log, global_step=self.step)
+        
+        return mean_reward
+    
+    
 class MemoryEfficientPPO(PPO):
     """ PPO with reduced GPU memory footprint.
         Key differences from PPO:
