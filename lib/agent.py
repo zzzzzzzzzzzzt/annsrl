@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from collections import namedtuple
+from .Nodeformer import NodeFormer
 
 
 class BaseAgent(nn.Module):
@@ -89,3 +90,69 @@ class SimpleNeuralAgent(ProbabilisticAgent):
         probs = torch.cat([theta, 1. - theta], dim=-1)
         return probs.log()
 
+
+class NodeFormerAgent(ProbabilisticAgent):
+    """
+    Agent that encodes all graph nodes with NodeFormer once per step,
+    then uses the resulting hidden vectors for edge prediction.
+    State.vertices: [N, hidden_size] NodeFormer hidden representations.
+    """
+    State = namedtuple("AgentState", ['vertices'])
+
+    def __init__(self, vertex_size, nf_hidden_size, mlp_hidden_size,
+                 num_layers=2, num_heads=4,
+                 nb_random_features=30, use_bn=True, use_residual=True,
+                 min_prob=1e-4):
+        super().__init__()
+        self.min_prob = min_prob
+        self.max_prob = 1. - min_prob
+
+        # NodeFormer encodes raw features → hidden reps; no edge loss needed here
+        self.encoder = NodeFormer(
+            in_channels=vertex_size,
+            hidden_channels=nf_hidden_size,
+            out_channels=nf_hidden_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            nb_random_features=nb_random_features,
+            use_bn=use_bn,
+            use_residual=use_residual,
+            use_gumbel=False,
+            use_edge_loss=False,
+        )
+
+        self.edge_network = nn.Sequential(
+            nn.Linear(2 * nf_hidden_size, mlp_hidden_size),
+            nn.ELU(),
+            nn.Linear(mlp_hidden_size, 1),
+        )
+
+    def _build_edge_index(self, graph, device):
+        src, dst = [], []
+        for v, neighbors in graph.edges.items():
+            for nb in neighbors:
+                src.append(int(v))
+                dst.append(int(nb))
+        return (
+            torch.tensor(src, dtype=torch.long, device=device),
+            torch.tensor(dst, dtype=torch.long, device=device),
+        )
+
+    def prepare_state(self, graph, device='cpu', **kwargs):
+        """Encode all nodes with NodeFormer; returned state.vertices are hidden reps."""
+        x = graph.vertices.to(device)
+        edge_index = self._build_edge_index(graph, device)
+        adjs = [edge_index]
+        self.eval()
+        with torch.no_grad():
+            hidden = self.encoder(x, adjs)   # [N, hidden_size]
+        self.train()
+        return self.State(vertices=hidden)
+
+    def get_edge_logp(self, from_vertex_ids, to_vertex_ids, *, state, device='cpu', **kwargs):
+        h_from = state.vertices[from_vertex_ids].to(device)
+        h_to   = state.vertices[to_vertex_ids].to(device)
+        theta = torch.sigmoid(self.edge_network(torch.cat([h_from, h_to], dim=-1)))
+        theta = theta * (self.max_prob - self.min_prob) + self.min_prob
+        probs = torch.cat([theta, 1. - theta], dim=-1)
+        return probs.log()

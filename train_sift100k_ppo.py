@@ -57,7 +57,13 @@ max_dcs = 1000            # reward hyperparameter
 # Agent params #
 ################
 
-hidden_size = 2048        # number of hidden units
+hidden_size = 32         # NodeFormer hidden / output dimension
+mlp_hidden_size = 128     # edge MLP hidden dimension
+num_layers = 2            # number of NodeFormer message-passing layers
+num_heads = 4             # number of attention heads
+nb_random_features = 30   # random features for kernelized softmax
+use_bn = True             # layer normalization
+use_residual = True       # residual connections
 
 ####################
 # Algorithm params #
@@ -132,7 +138,16 @@ if restore_step is not None:
     baseline = torch.load("runs/{}/baseline.{}.pth".format(exp_name, restore_step), weights_only=False)
     hnsw.edge_confidence = torch.load("runs/{}/edge_confidence.{}.pth".format(exp_name, restore_step), weights_only=False)
 else:
-    agent = lib.SimpleNeuralAgent(graph.vertices.shape[1], hidden_size=hidden_size)
+    agent = lib.NodeFormerAgent(
+        graph.vertices.shape[1],
+        hidden_size=hidden_size,
+        mlp_hidden_size=mlp_hidden_size,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        nb_random_features=nb_random_features,
+        use_bn=use_bn,
+        use_residual=use_residual,
+    )
     baseline = lib.SessionBaseline(graph.train_queries.size(0))
     
 reward = lib.MaxDCSReward(k=k, max_dcs=max_dcs)
@@ -175,9 +190,9 @@ for batch_queries, batch_gt, batch_query_ids in train_batcher:
     mean_reward = trainer.train_step(batch_queries, batch_gt, query_index=batch_query_ids)
     reward_history.append(mean_reward)
 
-    # if trainer.step % update_edges_every == 0:
-    #     promoted = hnsw.update_edges()
-    #     trainer.writer.add_scalar('train/promoted_edges', promoted, global_step=trainer.step)
+    if trainer.step % update_edges_every == 0:
+        promoted = hnsw.update_edges()
+        trainer.writer.add_scalar('train/promoted_edges', promoted, global_step=trainer.step)
         
     if trainer.step % 10 == 0:
         val_reward = trainer.evaluate(*next(val_iterator), prefix='val')
