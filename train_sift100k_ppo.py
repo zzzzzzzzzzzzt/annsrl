@@ -76,6 +76,7 @@ batch_size = 100000       # number of sessions per batch
 update_edges_every = 10   # call hnsw.update_edges() every N steps
 
 n_jobs = 8                # Number of threads for C++ sampling
+n_hop_virtual = 72
 max_steps = 1000          # Max number of training iterations
 
 # Recover settings
@@ -125,7 +126,7 @@ print('exp name:', exp_name)
 # !rm {'./runs/' + exp_name} -rf # KEEP COMMENTED!
 assert restore_step is not None or not os.path.exists('./runs/' + exp_name)
 
-hnsw = lib.ParallelHNSW(graph, ef=ef, k=k, edge_patience=edge_patience, n_jobs=n_jobs)
+hnsw = lib.ParallelHNSW(graph, ef=ef, k=k, edge_patience=edge_patience, n_jobs=n_jobs, n_hop_virtual=n_hop_virtual)
 
 if restore_step is not None:
     agent = torch.load("runs/{}/agent.{}.pth".format(exp_name, restore_step), weights_only=False)
@@ -175,9 +176,9 @@ for batch_queries, batch_gt, batch_query_ids in train_batcher:
     mean_reward = trainer.train_step(batch_queries, batch_gt, query_index=batch_query_ids)
     reward_history.append(mean_reward)
 
-    # if trainer.step % update_edges_every == 0:
-    #     promoted = hnsw.update_edges()
-    #     trainer.writer.add_scalar('train/promoted_edges', promoted, global_step=trainer.step)
+    if trainer.step % update_edges_every == 0:
+        promoted = hnsw.update_edges()
+        trainer.writer.add_scalar('train/promoted_edges', promoted, global_step=trainer.step)
         
     if trainer.step % 10 == 0:
         val_reward = trainer.evaluate(*next(val_iterator), prefix='val')
