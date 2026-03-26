@@ -117,7 +117,7 @@ class NodeFormerAgent(ProbabilisticAgent):
             nb_random_features=nb_random_features,
             use_bn=use_bn,
             use_residual=use_residual,
-            use_gumbel=False,
+            use_gumbel=True,
             use_edge_loss=False,
         )
 
@@ -138,15 +138,19 @@ class NodeFormerAgent(ProbabilisticAgent):
             torch.tensor(dst, dtype=torch.long, device=device),
         )
 
-    def prepare_state(self, graph, device='cpu', **kwargs):
+    def prepare_state(self, graph, device='cuda', training=False, **kwargs):
         """Encode all nodes with NodeFormer; returned state.vertices are hidden reps."""
         x = graph.vertices.to(device)
-        edge_index = self._build_edge_index(graph, device)
-        adjs = [edge_index]
-        self.eval()
-        with torch.no_grad():
+        # edge_index = self._build_edge_index(graph, device)
+        # adjs = [edge_index]
+        adjs = None
+        if training:
             hidden = self.encoder(x, adjs)   # [N, hidden_size]
-        self.train()
+        else:
+            self.eval()
+            with torch.no_grad():
+                hidden = self.encoder(x, adjs)   # [N, hidden_size]
+            # self.train()
         return self.State(vertices=hidden)
 
     def get_edge_logp(self, from_vertex_ids, to_vertex_ids, *, state, device='cpu', **kwargs):

@@ -417,43 +417,40 @@ class OptimizedPPO(BaseAlgorithm):
         total_loss = total_ent = total_kl = 0.0
         n_updates = 0
 
-        # 5. PPO 多轮迭代 (Epochs)
         for epoch in range(self.ppo_epochs):
             perm = torch.randperm(n_unique, device=self.device)
             epoch_kl = 0.0
 
+            # Encode once per epoch; share graph across mini-batches via gradient accumulation
+            state = self.agent.prepare_state(self.hnsw.graph, device=self.device, training=True, **kwargs)
+            self.optimizer.zero_grad()
+
             for start in range(0, n_unique, self.samples_in_batch):
                 idx = perm[start:start + self.samples_in_batch]
-                
+
                 batch_freqs = freqs[idx]
                 freqs_sum = batch_freqs.sum()
 
-                # 前向传播 (此时天然是被 samples_in_batch 分块的，安全)
                 logp = self.agent.get_edge_logp(from_vertex_ids[idx], to_vertex_ids[idx],
                                                 state=state, device=self.device)
                 logp_action = torch.gather(logp, dim=-1, index=actions[idx, None])[:, 0]
 
-                # 计算 Importance Sampling Ratio
                 ratio = torch.exp(logp_action - old_logp_action[idx])
                 adv = advantage[idx]
 
-                # Surrogate Loss
                 surr1 = ratio * adv
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
                 policy_loss = -(torch.min(surr1, surr2) * batch_freqs).sum() / freqs_sum
 
-                # Entropy Regularization
                 ent = (-logp.exp() * logp).sum(-1)
                 ent_loss = (ent * batch_freqs).sum() / freqs_sum
-                
+
                 loss = policy_loss - self.entropy_reg * ent_loss
 
-                # 反向传播与优化
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                # Accumulate gradients; retain graph since state is shared across mini-batches
+                loss.backward(retain_graph=True)
 
-                # 计算 KL 散度
+                # KL (no grad)
                 with torch.no_grad():
                     old_lp = old_logp[idx]
                     kl = (batch_freqs * (old_lp.exp() * (old_lp - logp.detach())).sum(-1)).sum() / freqs_sum
@@ -461,15 +458,14 @@ class OptimizedPPO(BaseAlgorithm):
                 total_loss += loss.item()
                 total_ent += ent_loss.item()
                 total_kl += kl.item()
-                
-                # 按频次加权统计 epoch 的总 KL
                 epoch_kl += kl.item() * (freqs_sum.item() / freqs.sum().item())
                 n_updates += 1
 
-            # 6. KL 早停机制 (Early Stopping)
+            # Single optimizer step per epoch after all gradients are accumulated
+            self.optimizer.step()
+
+            # KL early stopping
             if self.target_kl is not None and epoch_kl > 1.5 * self.target_kl:
-                # 可以在这里加个 print 观察是否触发早停
-                # print(f"KL early stopping triggered at epoch {epoch}")
                 break
 
         # 写日志

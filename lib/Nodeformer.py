@@ -273,12 +273,13 @@ class NodeFormerConv(nn.Module):
             projection_matrix = create_projection_matrix(
                 self.nb_random_features, dim, seed=seed).to(query.device)
 
+        adj_index = None if adjs is None else adjs[0]
         # compute all-pair message passing update and attn weight on input edges, requires O(N) or O(N + E)
         if self.use_gumbel and self.training:  # only using Gumbel noise for training
-            z_next, weight = kernelized_gumbel_softmax(query,key,value,self.kernel_transformation,projection_matrix,adjs[0],
+            z_next = kernelized_gumbel_softmax(query,key,value,self.kernel_transformation,projection_matrix, adj_index,
                                                   self.nb_gumbel_sample, tau, self.use_edge_loss)
         else:
-            z_next, weight = kernelized_softmax(query, key, value, self.kernel_transformation, projection_matrix, adjs[0],
+            z_next = kernelized_softmax(query, key, value, self.kernel_transformation, projection_matrix, adj_index,
                                                 tau, self.use_edge_loss)
 
         # compute update by relational bias of input adjacency, requires O(E)
