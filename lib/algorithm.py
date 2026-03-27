@@ -372,6 +372,7 @@ class OptimizedPPO(BaseAlgorithm):
         self.entropy_reg = entropy_reg
         self.target_kl = target_kl
         self.optimizer = optimizer or torch.optim.Adam(agent.parameters(), lr=lr)
+        self.scaler = torch.cuda.amp.GradScaler()
 
     def train_on_batch(self, state, from_vertex_ids, to_vertex_ids, actions, rewards, session_index, **kwargs):
         # 1. 获取 Baseline 并计算 Advantage
@@ -400,11 +401,12 @@ class OptimizedPPO(BaseAlgorithm):
                 end = min(start + self.samples_in_batch, n_unique)
                 
                 # 仅对一小块数据做前向传播
-                chunk_logp = self.agent.get_edge_logp(
-                    from_vertex_ids[start:end], 
-                    to_vertex_ids[start:end],
-                    state=state, device=self.device
-                )
+                with torch.cuda.amp.autocast():
+                    chunk_logp = self.agent.get_edge_logp(
+                        from_vertex_ids[start:end], 
+                        to_vertex_ids[start:end],
+                        state=state, device=self.device
+                    )
                 chunk_action = actions[start:end]
                 
                 old_logp_list.append(chunk_logp)
@@ -432,8 +434,9 @@ class OptimizedPPO(BaseAlgorithm):
                 batch_freqs = freqs[idx]
                 freqs_sum = batch_freqs.sum()
 
-                logp = self.agent.get_edge_logp(from_vertex_ids[idx], to_vertex_ids[idx],
-                                                state=state, device=self.device)
+                with torch.cuda.amp.autocast():
+                    logp = self.agent.get_edge_logp(from_vertex_ids[idx], to_vertex_ids[idx],
+                                                    state=state, device=self.device).float()
                 logp_action = torch.gather(logp, dim=-1, index=actions[idx, None])[:, 0]
 
                 ratio = torch.exp(logp_action - old_logp_action[idx])
@@ -452,7 +455,7 @@ class OptimizedPPO(BaseAlgorithm):
                 loss = loss * loss_scale  
 
                 # Accumulate gradients; retain graph since state is shared across mini-batches
-                loss.backward(retain_graph=True)
+                self.scaler.scale(loss).backward(retain_graph=True)
 
                 # KL (no grad)
                 with torch.no_grad():
@@ -466,7 +469,8 @@ class OptimizedPPO(BaseAlgorithm):
                 n_updates += 1
 
             # Single optimizer step per epoch after all gradients are accumulated
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)  
+            self.scaler.update() 
 
             # KL early stopping
             if self.target_kl is not None and epoch_kl > 1.5 * self.target_kl:

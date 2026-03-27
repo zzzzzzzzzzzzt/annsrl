@@ -69,7 +69,7 @@ use_residual = True       # residual connections
 # Algorithm params #
 ####################
 
-samples_in_batch = 1024   # PPO mini-batch size per gradient step
+samples_in_batch = 4096   # PPO mini-batch size per gradient step
 ppo_epochs = 4            # number of gradient passes over each session batch
 lr = 3e-4                 # Adam learning rate
 clip_eps = 0.2            # PPO clipping epsilon
@@ -78,7 +78,7 @@ edge_patience = 400       # How many iterations are needed without the change of
                           # Very important for training procedure efficiency
 
 entropy_reg = 0.01        # coefficient in front of the entropy regularizer term
-batch_size = 10000       # number of sessions per batch
+batch_size = 100000       # number of sessions per batch
 update_edges_every = 10   # call hnsw.update_edges() every N steps
 
 n_jobs = 8                # Number of threads for C++ sampling

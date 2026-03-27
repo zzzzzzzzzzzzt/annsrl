@@ -144,13 +144,14 @@ class NodeFormerAgent(ProbabilisticAgent):
         # edge_index = self._build_edge_index(graph, device)
         # adjs = [edge_index]
         adjs = None
-        if training:
-            hidden = self.encoder(x, adjs)   # [N, hidden_size]
-        else:
-            self.eval()
-            with torch.no_grad():
-                hidden = self.encoder(x, adjs)   # [N, hidden_size]
-            # self.train()
+        with torch.cuda.amp.autocast():
+            if training:
+                hidden = self.encoder(x, adjs).float()   # [N, hidden_size]
+            else:
+                self.eval()
+                with torch.no_grad():
+                    hidden = self.encoder(x, adjs).float()   # [N, hidden_size]
+                    # self.train()
         return self.State(vertices=hidden)
 
     def get_edge_logp(self, from_vertex_ids, to_vertex_ids, *, state, device='cpu', **kwargs):
