@@ -67,3 +67,7 @@ class SessionBaseline(BaselineInterface):
 
     def get(self, session_index, query_index, device='cpu', **kwargs):
         return self.baseline.to(device=device)[query_index.to(device=device)[session_index]]
+    
+    def get_nonzero_baselines(self):
+        nonzero_baselines = self.baseline[self.baseline != 0].mean().item()
+        return nonzero_baselines

@@ -380,6 +380,7 @@ class OptimizedPPO(BaseAlgorithm):
                                      rewards=rewards, session_index=session_index, device=self.device, **kwargs)
         mean_reward = self.baseline.update(state=state, from_vertex_ids=from_vertex_ids, to_vertex_ids=to_vertex_ids,
                                            rewards=rewards, session_index=session_index, device=self.device, **kwargs)
+        nonzero_baseline = self.baseline.get_nonzero_baselines()
 
         advantage = (rewards - baseline).detach()
         adv_mean_log = advantage.mean().item()
@@ -483,6 +484,7 @@ class OptimizedPPO(BaseAlgorithm):
             self.writer.add_scalar('train/kl', total_kl / n_updates, global_step=self.step)
             
         self.writer.add_scalar('train/baseline', baseline.mean().item(), global_step=self.step)
+        self.writer.add_scalar('train/nonzero_baseline', nonzero_baseline, global_step=self.step)
         self.writer.add_scalar('train/advantage', adv_mean_log, global_step=self.step)
         
         return mean_reward
