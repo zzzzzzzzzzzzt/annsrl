@@ -123,7 +123,7 @@ class BaseAlgorithm:
         :param batch_ground_truth_ids: indices of actual nearest neighbors, [batch_size]
         :param prefix: prefix for metric names
         """
-        summary = self.get_session_batch(batch_queries, batch_ground_truth_ids, greedy=True,
+        summary = self.get_session_batch(batch_queries, batch_ground_truth_ids, greedy=True, sample_device='cpu', 
                                    summarize=True, prefix=prefix, is_evaluate=True, **kwargs)['summary']
         mean_reward = np.mean(summary[prefix + '/mean_reward'])
         return mean_reward
@@ -416,6 +416,7 @@ class OptimizedPPO(BaseAlgorithm):
 
         total_loss = total_ent = total_kl = 0.0
         n_updates = 0
+        total_freqs = freqs.sum()
 
         for epoch in range(self.ppo_epochs):
             perm = torch.randperm(n_unique, device=self.device)
@@ -446,6 +447,9 @@ class OptimizedPPO(BaseAlgorithm):
                 ent_loss = (ent * batch_freqs).sum() / freqs_sum
 
                 loss = policy_loss - self.entropy_reg * ent_loss
+                # 缩放比例为当前 batch 的权重占整个数据集权重的比例  
+                loss_scale = freqs_sum / total_freqs  
+                loss = loss * loss_scale  
 
                 # Accumulate gradients; retain graph since state is shared across mini-batches
                 loss.backward(retain_graph=True)
@@ -455,7 +459,7 @@ class OptimizedPPO(BaseAlgorithm):
                     old_lp = old_logp[idx]
                     kl = (batch_freqs * (old_lp.exp() * (old_lp - logp.detach())).sum(-1)).sum() / freqs_sum
 
-                total_loss += loss.item()
+                total_loss += (loss.item() / loss_scale.item()) 
                 total_ent += ent_loss.item()
                 total_kl += kl.item()
                 epoch_kl += kl.item() * (freqs_sum.item() / freqs.sum().item())
