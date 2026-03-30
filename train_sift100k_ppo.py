@@ -57,10 +57,10 @@ max_dcs = 1000            # reward hyperparameter
 # Agent params #
 ################
 
-hidden_size = 32         # NodeFormer hidden / output dimension
+hidden_size = 256         # NodeFormer hidden / output dimension
 mlp_hidden_size = 128     # edge MLP hidden dimension
 num_layers = 2            # number of NodeFormer message-passing layers
-num_heads = 6             # number of attention heads
+num_heads = 4             # number of attention heads
 nb_random_features = 30   # random features for kernelized softmax
 use_bn = True             # layer normalization
 use_residual = True       # residual connections
@@ -152,13 +152,14 @@ else:
     
 reward = lib.MaxDCSReward(k=k, max_dcs=max_dcs)
 trainer = lib.OptimizedPPO(agent, hnsw, reward, baseline,
-                  lr=lr,
-                  clip_eps=clip_eps,
-                  ppo_epochs=ppo_epochs,
-                  samples_in_batch=samples_in_batch,
-                  entropy_reg=entropy_reg,
-                  target_kl=0.015,                   # 加入早停保障
-                  writer=SummaryWriter('./runs/' + exp_name))
+                lr=lr,
+                clip_eps=clip_eps,
+                ppo_epochs=ppo_epochs,
+                samples_in_batch=samples_in_batch,
+                entropy_reg=entropy_reg,
+                target_kl=0.015,                   # 加入早停保障
+                warmup_steps=2,                   # 冷启动：先预热baseline再更新模型
+                writer=SummaryWriter('./runs/' + exp_name))
 
 if restore_step is not None:
     trainer.step = restore_step

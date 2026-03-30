@@ -41,6 +41,11 @@ class SessionBaseline(BaselineInterface):
         self.baseline = torch.zeros(sessions_size)
         self.updated = torch.zeros(sessions_size, dtype=torch.uint8)
         self.step = 0
+        
+    @property
+    def is_initialized(self):
+        """True after every session slot has been updated at least once."""
+        return self.step > 0
 
     def update(self, rewards, session_index, query_index, device='cpu', **kwargs):
         session_lengths = torch.bincount(session_index).to(torch.float32).cpu()

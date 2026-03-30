@@ -10,12 +10,16 @@ from pandas import DataFrame
 
 class BaseAlgorithm:
     """ A trainer class that updates agent parameters and draws logs """
-    def __init__(self, agent, hnsw, reward, baseline=None, writer=None, device='cuda'):
+    def __init__(self, agent, hnsw, reward, baseline=None, writer=None, device='cuda',
+                 warmup_steps=0):
         """
         :type agent: lib.agent.BaseAgent
         :type hnsw: lib.hnsw.HNSW
         :type reward: function **session_records: vector of rewards for each action in session
         :type baseline: lib.baseline.BaselineInterface
+        :param warmup_steps: number of steps to collect experience and update the baseline
+            without performing any policy gradient update. Resolves the cold-start problem
+            where the baseline starts at all-zeros and produces meaningless advantages.
         """
         self.hnsw = hnsw
         self.agent = agent
@@ -24,6 +28,7 @@ class BaseAlgorithm:
         self.baseline = baseline
         self.writer = writer or SummaryWriter()
         self.step = 0
+        self.warmup_steps = warmup_steps
 
         self.tensor_dtypes = {
             'from_vertex_ids': torch.int64,
@@ -109,6 +114,21 @@ class BaseAlgorithm:
         :returns: mean reward
         """
         batch_records = self.get_session_batch(batch_queries, batch_ground_truth_ids, **kwargs)
+
+        # Warmup phase: update baseline only, skip policy gradient
+        if self.warmup_steps > 0 and self.step < self.warmup_steps:
+            if self.baseline is not None:
+                self.baseline.update(
+                    rewards=batch_records['rewards'],
+                    session_index=batch_records['session_index'],
+                    device=self.device,
+                    **kwargs,
+                )
+            # self.writer.add_scalar('train/warmup_step', self.step, global_step=self.step)
+            mean_reward = batch_records['rewards'].mean().item()
+            self.step += 1
+            return mean_reward
+
         mean_reward = self.train_on_batch(**batch_records, **kwargs)
         self.step += 1
         return mean_reward
