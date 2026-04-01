@@ -58,8 +58,8 @@ max_dcs = 1000            # reward hyperparameter
 ################
 
 hidden_size = 256         # NodeFormer hidden / output dimension
-mlp_hidden_size = 128     # edge MLP hidden dimension
-num_layers = 2            # number of NodeFormer message-passing layers
+mlp_hidden_size = 2048     # edge MLP hidden dimension
+num_layers = 1            # number of NodeFormer message-passing layers
 num_heads = 4             # number of attention heads
 nb_random_features = 30   # random features for kernelized softmax
 use_bn = True             # layer normalization
@@ -70,9 +70,9 @@ use_residual = True       # residual connections
 ####################
 
 samples_in_batch = 4096   # PPO mini-batch size per gradient step
-ppo_epochs = 4            # number of gradient passes over each session batch
-lr = 3e-4                 # Adam learning rate
-clip_eps = 0.2            # PPO clipping epsilon
+ppo_epochs = 2            # number of gradient passes over each session batch
+lr = 2e-4                 # Adam learning rate
+clip_eps = 0.1            # PPO clipping epsilon
 edge_patience = 400       # How many iterations are needed without the change of edge probability
                           # to denote the prediction as confident and make it deterministic
                           # Very important for training procedure efficiency

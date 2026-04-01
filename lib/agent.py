@@ -124,6 +124,8 @@ class NodeFormerAgent(ProbabilisticAgent):
         self.edge_network = nn.Sequential(
             nn.Linear(2 * nf_hidden_size, mlp_hidden_size),
             nn.ELU(),
+            nn.Linear(mlp_hidden_size, mlp_hidden_size),
+            nn.ELU(),
             nn.Linear(mlp_hidden_size, 1),
         )
 
