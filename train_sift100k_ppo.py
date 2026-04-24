@@ -64,9 +64,9 @@ hidden_size = 2048        # number of hidden units
 ####################
 
 samples_in_batch = 4096   # PPO mini-batch size per gradient step
-ppo_epochs = 4            # number of gradient passes over each session batch
-lr = 3e-4                 # Adam learning rate
-clip_eps = 0.2            # PPO clipping epsilon
+ppo_epochs = 3            # number of gradient passes over each session batch
+lr = 2e-4                 # Adam learning rate
+clip_eps = 0.1            # PPO clipping epsilon
 edge_patience = 400       # How many iterations are needed without the change of edge probability
                           # to denote the prediction as confident and make it deterministic
                           # Very important for training procedure efficiency
@@ -133,7 +133,7 @@ if restore_step is not None:
     hnsw.edge_confidence = torch.load("runs/{}/edge_confidence.{}.pth".format(exp_name, restore_step), weights_only=False)
 else:
     agent = lib.SimpleNeuralAgent(graph.vertices.shape[1], hidden_size=hidden_size)
-    baseline = lib.SessionBaseline(graph.train_queries.size(0))
+    baseline = lib.SessionBaseline(graph.train_queries.size(0) + graph.vertices.size(0))
     
 reward = lib.MaxDCSReward(k=k, max_dcs=max_dcs)
 trainer = lib.OptimizedPPO(agent, hnsw, reward, baseline,
@@ -158,9 +158,22 @@ best_val_step = 0
 best_val_reward = 0
 
 # generate batches of [queries, ground truth, train_query_ids (for baseline)]
-train_query_ids = torch.arange(graph.train_queries.size(0))
-train_batcher = lib.utils.iterate_minibatches(graph.train_queries, graph.train_gt, train_query_ids, 
-                                              batch_size=batch_size)
+# 1. 获取图节点数量和 query 数量    
+num_train_queries = graph.train_queries.size(0)    
+num_vertices = graph.vertices.size(0)    
+     
+train_gt_top1 = graph.train_gt[:, :1]    
+vertices_gt_top1 = torch.arange(num_vertices).unsqueeze(1).to(graph.train_gt.device)    
+      
+train_query_ids = torch.arange(num_train_queries)
+vertices_query_ids = torch.arange(num_train_queries, num_train_queries + num_vertices)    
+      
+mixed_queries = torch.cat([graph.train_queries, graph.vertices], dim=0)    
+mixed_gt = torch.cat([train_gt_top1, vertices_gt_top1], dim=0)
+mixed_query_ids = torch.cat([train_query_ids, vertices_query_ids], dim=0)    
+    
+train_batcher = lib.utils.iterate_minibatches(mixed_queries, mixed_gt,     
+                                            mixed_query_ids, batch_size=batch_size)    
 
 # generate batches of [queries, ground truth]           
 val_iterator = lib.utils.iterate_minibatches(graph.val_queries, graph.val_gt, 
