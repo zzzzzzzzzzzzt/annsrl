@@ -1,7 +1,7 @@
 import warnings
 from .utils import knn, read_edges, read_fvecs, read_ivecs, read_nsg
 import torch
-
+import numpy as np
 
 class Graph:
     def __init__(self, vertices_path, edges_path,
@@ -81,3 +81,71 @@ class Graph:
         self.train_gt = self.train_gt[:-val_queries_size]
 
         
+class pretrain_graph:
+    def __init__(self, vertices_path, edges_path, graph_type='nsw',
+                 vertices_size=None, normalization='global'):
+        """
+        :param vertices_path: path to base datapoints
+        :param normalization: normalization of base datapoints {'none', 'global', 'instance'}
+        :param graph_type: supported graph types: {'nsw', 'nsg'}.
+        """
+        self.graph_type = graph_type
+        vertices = torch.tensor(read_fvecs(vertices_path, vertices_size))
+        if vertices_size == None:
+            self.vertices_size = vertices.shape[0]
+        else:
+            self.vertices_size = vertices_size
+        self.max_level = 0
+        if graph_type == 'nsw':
+            self.edgeindex = read_edges(edges_path, vertices.shape[0])
+            self.max_degree = max(map(len, self.edges.values()))
+        elif graph_type == 'nsg':
+            info, self.edgeindex = read_nsg(edges_path)
+            self.initial_vertex_id = info['enterpoint_node']
+            self.max_degree = info['width']
+        else:
+            raise ValueError("Only ['nsw', 'nsg'] graph types are supported")
+        
+        src = []
+        dst = []
+        for u, neighbors in self.edgeindex.items():
+            for v in neighbors:
+                src.append(u)
+                dst.append(v)
+        
+        self.edges = torch.tensor([src, dst], dtype=torch.long)
+
+        if normalization == 'none':
+            warnings.warn("Data not normalized, individual norms:",
+                          ((vertices ** 2).sum(-1) ** 0.5).cpu().numpy())
+            normalize = lambda v: v
+        elif normalization == 'global':
+            mean_norm = ((vertices ** 2).sum(-1) ** 0.5).mean().item()
+            normalize = lambda v: v / mean_norm
+        elif normalization == 'instance':
+            normalize = lambda v: v / (v ** 2).sum(-1, keepdim=True) ** 0.5
+        else:
+            raise ValueError("normalization parameter must be in ['none', 'global', 'instance']")
+
+        self.vertices= normalize
+
+    def get_idx_split(self, split_type='random', train_prop=.5, valid_prop=.25, label_num_per_class=20):
+        """
+        split_type: 'random' for random splitting, 'class' for splitting with equal node num per class
+        train_prop: The proportion of dataset for train split. Between 0 and 1.
+        valid_prop: The proportion of dataset for validation split. Between 0 and 1.
+        label_num_per_class: num of nodes per class
+        """
+
+        if split_type == 'random':
+            n = self.vertices_size
+            train_num = int(n * train_prop)
+            valid_num = int(n * valid_prop)
+
+            perm = torch.as_tensor(np.random.permutation(n))
+
+            train_indices = perm[:train_num]
+            val_indices = perm[train_num:train_num + valid_num]
+            test_indices = perm[train_num + valid_num:]
+
+        return {'train':train_indices, 'valid':val_indices, 'test':test_indices}
