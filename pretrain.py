@@ -5,15 +5,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.utils import to_undirected, remove_self_loops, add_self_loops
+from torch_geometric.utils import add_self_loops, subgraph
 from sklearn.neighbors import kneighbors_graph
 
-from logger import Logger
-from dataset import load_dataset
-from data_utils import load_fixed_splits, adj_mul, get_gpu_memory_map
-from eval import evaluate, eval_acc, eval_rocauc, eval_f1
+from lib.logger import Logger
 from lib.parse import parser_add_main_args
-import lib.graph import pretrain_graph
+from lib.graph import pretrain_graph
+from lib.Nodeformer import NodeFormer
 import time
 
 import warnings
@@ -43,12 +41,6 @@ else:
 ### Load and preprocess data ###
 dataset = pretrain_graph(args.vertices_path, args.edges_path)
 
-# get the splits for all runs
-
-split_idx_lst = [dataset.get_idx_split(train_prop=args.train_prop, valid_prop=args.valid_prop)
-                    for _ in range(args.runs)]
-
-
 ### Basic information of datasets ###
 n = dataset.vertices_size
 e = dataset.edges.shape[0]
@@ -56,23 +48,11 @@ d = dataset.vertices.shape[1]
 
 print(f"dataset {args.dataset} | num nodes {n} | num edge {e} | num node feats {d}")
 
-
 ### Load method ###
-model = parse_method(args, dataset, n, d, device)
-
-### Loss function (Single-class, Multi-class) ###
-if args.dataset in ('yelp-chi', 'deezer-europe', 'twitch-e', 'fb100', 'ogbn-proteins'):
-    criterion = nn.BCEWithLogitsLoss()
-else:
-    criterion = nn.NLLLoss()
-
-### Performance metric (Acc, AUC, F1) ###
-if args.metric == 'rocauc':
-    eval_func = eval_rocauc
-elif args.metric == 'f1':
-    eval_func = eval_f1
-else:
-    eval_func = eval_acc
+model=NodeFormer(d, args.hidden_channels, d, num_layers=args.num_layers, dropout=args.dropout,
+            num_heads=args.num_heads, use_bn=args.use_bn, nb_random_features=args.M,
+            use_gumbel=args.use_gumbel, use_residual=args.use_residual, use_act=args.use_act, use_jk=args.use_jk,
+            nb_gumbel_sample=args.K, rb_order=args.rb_order, rb_trans=args.rb_trans).to(device)
 
 logger = Logger(args.runs, args)
 
@@ -89,13 +69,18 @@ for i in range(args.rb_order - 1): # edge_index of high order adjacency
     adjs.append(adj)
 dataset.graph['adjs'] = adjs
 
+dataset.vertices, dataset.edges, dataset.train_edges = \
+    dataset.vertices.to(device), dataset.edges.to(device), dataset.train_edges.to(device)
+
+train_idx, valid_idx, test_idx = \
+    dataset.split_idx_lst['train'].to(device), \
+    dataset.split_idx_lst['valid'].to(device), \
+    dataset.split_idx_lst['test'].to(device)
+
 ### Training loop ###
 for run in range(args.runs):
-    if args.dataset in ['cora', 'citeseer', 'pubmed'] and args.protocol == 'semi':
-        split_idx = split_idx_lst[0]
-    else:
-        split_idx = split_idx_lst[run]
-    train_idx = split_idx['train'].to(device)
+    split_idx = dataset.split_idx_lst
+
     model.reset_parameters()
     optimizer = torch.optim.Adam(model.parameters(),weight_decay=args.weight_decay, lr=args.lr)
     best_val = float('-inf')
@@ -104,26 +89,31 @@ for run in range(args.runs):
         model.train()
         optimizer.zero_grad()
 
-        _, link_loss_ = model(dataset.graph['node_feat'], dataset.graph['adjs'], args.tau)
-        loss -= args.lamda * sum(link_loss_) / len(link_loss_)
+        _, link_loss_, _ = model(dataset.vertices[train_idx], dataset.train_edges, args.tau)
+        loss = -torch.mean(link_loss_[-1])
 
         loss.backward()
         optimizer.step()
 
         if epoch % args.eval_step == 0:
-            result = evaluate(model, dataset, split_idx, eval_func, criterion, args)
-            logger.add_result(run, result[:-1])
+            model.eval()
+            with torch.no_grad():
+                _, _, weight = model(dataset.vertices, dataset.edges, args.tau)
 
-            if result[1] > best_val:
-                best_val = result[1]
+                train_acc = weight[-1][train_idx].mean().item()
+                valid_acc = weight[-1][valid_idx].mean().item()
+                test_acc = weight[-1][test_idx].mean().item()
+
+            if valid_acc > best_val:
+                best_val = valid_acc
                 if args.save_model:
                     torch.save(model.state_dict(), args.model_dir + f'{args.dataset}-{args.method}.pkl')
 
             print(f'Epoch: {epoch:02d}, '
                   f'Loss: {loss:.4f}, '
-                  f'Train: {100 * result[0]:.2f}%, '
-                  f'Valid: {100 * result[1]:.2f}%, '
-                  f'Test: {100 * result[2]:.2f}%')
+                  f'Train: {100 * train_acc:.2f}%, '
+                  f'Valid: {100 * valid_acc:.2f}%, '
+                  f'Test: {100 * test_acc:.2f}%')
     logger.print_statistics(run)
 
 results = logger.print_statistics()
@@ -134,3 +124,14 @@ def adj_mul(adj_i, adj, N):
     adj_j = torch.sparse.mm(adj_i_sp, adj_sp)
     adj_j = adj_j.coalesce().indices()
     return adj_j
+
+@torch.no_grad()
+def evaluate(model, dataset, split_idx, args):
+    model.eval()
+    _, _, weight = model(dataset.graph['node_feat'], dataset.graph['adjs'], args.tau)
+
+    train_acc = weight[-1][split_idx['train']].mean().item()
+    valid_acc = weight[-1][split_idx['valid']].mean().item()
+    test_acc = weight[-1][split_idx['test']].mean().item()
+
+    return train_acc, valid_acc, test_acc

@@ -2,6 +2,7 @@ import warnings
 from .utils import knn, read_edges, read_fvecs, read_ivecs, read_nsg
 import torch
 import numpy as np
+from torch_geometric.utils import subgraph
 
 class Graph:
     def __init__(self, vertices_path, edges_path,
@@ -83,22 +84,23 @@ class Graph:
         
 class pretrain_graph:
     def __init__(self, vertices_path, edges_path, graph_type='nsw',
-                 vertices_size=None, normalization='global'):
+                train_prop=.5, valid_prop=.25,
+                vertices_size=None, normalization='global'):
         """
         :param vertices_path: path to base datapoints
         :param normalization: normalization of base datapoints {'none', 'global', 'instance'}
         :param graph_type: supported graph types: {'nsw', 'nsg'}.
         """
         self.graph_type = graph_type
-        vertices = torch.tensor(read_fvecs(vertices_path, vertices_size))
+        self.vertices = torch.tensor(read_fvecs(vertices_path, vertices_size))
         if vertices_size == None:
-            self.vertices_size = vertices.shape[0]
+            self.vertices_size = self.vertices.shape[0]
         else:
             self.vertices_size = vertices_size
         self.max_level = 0
         if graph_type == 'nsw':
-            self.edgeindex = read_edges(edges_path, vertices.shape[0])
-            self.max_degree = max(map(len, self.edges.values()))
+            self.edgeindex = read_edges(edges_path, self.vertices.shape[0])
+            self.max_degree = max(map(len, self.edgeindex.values()))
         elif graph_type == 'nsg':
             info, self.edgeindex = read_nsg(edges_path)
             self.initial_vertex_id = info['enterpoint_node']
@@ -115,21 +117,14 @@ class pretrain_graph:
         
         self.edges = torch.tensor([src, dst], dtype=torch.long)
 
-        if normalization == 'none':
-            warnings.warn("Data not normalized, individual norms:",
-                          ((vertices ** 2).sum(-1) ** 0.5).cpu().numpy())
-            normalize = lambda v: v
-        elif normalization == 'global':
-            mean_norm = ((vertices ** 2).sum(-1) ** 0.5).mean().item()
-            normalize = lambda v: v / mean_norm
-        elif normalization == 'instance':
-            normalize = lambda v: v / (v ** 2).sum(-1, keepdim=True) ** 0.5
-        else:
-            raise ValueError("normalization parameter must be in ['none', 'global', 'instance']")
+        # get the splits for all runs
+        self.split_idx_lst = self.get_idx_split(train_prop=train_prop, valid_prop=valid_prop)
+        
+        # get train subgraph
+        self.train_edges, self.node_map = subgraph(self.split_idx_lst['train'], 
+                                                    self.edges, relabel_nodes=True)
 
-        self.vertices= normalize
-
-    def get_idx_split(self, split_type='random', train_prop=.5, valid_prop=.25, label_num_per_class=20):
+    def get_idx_split(self, split_type='random', train_prop=.5, valid_prop=.25):
         """
         split_type: 'random' for random splitting, 'class' for splitting with equal node num per class
         train_prop: The proportion of dataset for train split. Between 0 and 1.

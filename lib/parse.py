@@ -2,7 +2,6 @@ def parser_add_main_args(parser):
     # dataset, protocol
     parser.add_argument('--method', '-m', type=str, default='nodeformer')
     parser.add_argument('--dataset', type=str, default='')
-    parser.add_argument('--sub_dataset', type=str, default='')
     parser.add_argument('--graph_type', type=str, default='')
     parser.add_argument('--vertices_path', type=str, default='')
     parser.add_argument('--edges_path', type=str, default='')
@@ -25,8 +24,7 @@ def parser_add_main_args(parser):
     parser.add_argument('--rand_split_class', action='store_true',
                         help='use random splits with a fixed number of labeled nodes for each class')
     parser.add_argument('--label_num_per_class', type=int, default=20, help='labeled nodes randomly selected')
-    parser.add_argument('--metric', type=str, default='acc', choices=['acc', 'rocauc', 'f1'],
-                        help='evaluation metric')
+
     parser.add_argument('--knn_num', type=int, default=5, help='number of k for KNN graph')
     parser.add_argument('--save_model', action='store_true', help='whether to save model')
     parser.add_argument('--model_dir', type=str, default='../model/')

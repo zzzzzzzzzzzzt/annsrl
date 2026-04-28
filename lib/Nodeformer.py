@@ -276,10 +276,10 @@ class NodeFormerConv(nn.Module):
         adj_index = None if adjs is None else adjs[0]
         # compute all-pair message passing update and attn weight on input edges, requires O(N) or O(N + E)
         if self.use_gumbel and self.training:  # only using Gumbel noise for training
-            z_next = kernelized_gumbel_softmax(query,key,value,self.kernel_transformation,projection_matrix, adj_index,
+            z_next, weight = kernelized_gumbel_softmax(query,key,value,self.kernel_transformation,projection_matrix, adj_index,
                                                   self.nb_gumbel_sample, tau, self.use_edge_loss)
         else:
-            z_next = kernelized_softmax(query, key, value, self.kernel_transformation, projection_matrix, adj_index,
+            z_next, weight = kernelized_softmax(query, key, value, self.kernel_transformation, projection_matrix, adj_index,
                                                 tau, self.use_edge_loss)
 
         # compute update by relational bias of input adjacency, requires O(E)
@@ -294,9 +294,9 @@ class NodeFormerConv(nn.Module):
             d_in = degree(col, query.shape[1]).float()
             d_norm = 1. / d_in[col]
             d_norm_ = d_norm.reshape(1, -1, 1).repeat(1, 1, weight.shape[-1])
-            link_loss = torch.mean(weight.log() * d_norm_)
+            link_loss = weight.log() * d_norm_
 
-            return z_next, link_loss
+            return z_next, link_loss, weight
 
         else:
             return z_next
