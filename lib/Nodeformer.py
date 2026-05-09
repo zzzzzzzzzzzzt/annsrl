@@ -346,8 +346,10 @@ class NodeFormer(nn.Module):
 
     def forward(self, x, adjs, tau=1.0):
         x = x.unsqueeze(0) # [B, N, H, D], B=1 denotes number of graph
+        adjs = adjs.unsqueeze(0)
         layer_ = []
         link_loss_ = []
+        weight_ = []
         z = self.fcs[0](x)
         if self.use_bn:
             z = self.bns[0](z)
@@ -357,8 +359,9 @@ class NodeFormer(nn.Module):
 
         for i, conv in enumerate(self.convs):
             if self.use_edge_loss:
-                z, link_loss = conv(z, adjs, tau)
+                z, link_loss, weight = conv(z, adjs, tau)
                 link_loss_.append(link_loss)
+                weight_.append(weight)
             else:
                 z = conv(z, adjs, tau)
             if self.use_residual:
@@ -376,6 +379,6 @@ class NodeFormer(nn.Module):
         x_out = self.fcs[-1](z).squeeze(0)
 
         if self.use_edge_loss:
-            return x_out, link_loss_
+            return x_out, link_loss_, weight_
         else:
             return x_out

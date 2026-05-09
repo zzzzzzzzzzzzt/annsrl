@@ -67,7 +67,7 @@ adjs.append(adj)
 for i in range(args.rb_order - 1): # edge_index of high order adjacency
     adj = adj_mul(adj, adj, n)
     adjs.append(adj)
-dataset.graph['adjs'] = adjs
+# dataset.graph['adjs'] = adjs
 
 dataset.vertices, dataset.edges, dataset.train_edges = \
     dataset.vertices.to(device), dataset.edges.to(device), dataset.train_edges.to(device)
@@ -95,14 +95,14 @@ for run in range(args.runs):
         loss.backward()
         optimizer.step()
 
-        if epoch % args.eval_step == 0:
+        if epoch % args.eval_step == 0 and epoch > 0:
             model.eval()
             with torch.no_grad():
                 _, _, weight = model(dataset.vertices, dataset.edges, args.tau)
 
-                train_acc = weight[-1][train_idx].mean().item()
-                valid_acc = weight[-1][valid_idx].mean().item()
-                test_acc = weight[-1][test_idx].mean().item()
+                train_acc = weight[-1][:,train_idx].mean().item()
+                valid_acc = weight[-1][:,valid_idx].mean().item()
+                test_acc = weight[-1][:,test_idx].mean().item()
 
             if valid_acc > best_val:
                 best_val = valid_acc
