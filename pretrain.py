@@ -12,6 +12,8 @@ from lib.logger import Logger
 from lib.parse import parser_add_main_args
 from lib.graph import pretrain_graph
 from lib.Nodeformer import NodeFormer
+from lib.edge_pi_viz import maybe_plot_edge_attention
+from lib.z_viz import maybe_plot_z_layers
 import time
 
 import warnings
@@ -24,6 +26,13 @@ def fix_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
+
+def adj_mul(adj_i, adj, N):
+    adj_i_sp = torch.sparse_coo_tensor(adj_i, torch.ones(adj_i.shape[1], dtype=torch.float).to(adj.device), (N, N))
+    adj_sp = torch.sparse_coo_tensor(adj, torch.ones(adj.shape[1], dtype=torch.float).to(adj.device), (N, N))
+    adj_j = torch.sparse.mm(adj_i_sp, adj_sp)
+    adj_j = adj_j.coalesce().indices()
+    return adj_j
 
 ### Parse args ###
 parser = argparse.ArgumentParser(description='General Training Pipeline')
@@ -39,11 +48,12 @@ else:
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
 
 ### Load and preprocess data ###
-dataset = pretrain_graph(args.vertices_path, args.edges_path)
+dataset = pretrain_graph(args.vertices_path, args.edges_path, graph_type=args.graph_type,
+                         train_prop=args.train_prop, valid_prop=args.valid_prop)
 
 ### Basic information of datasets ###
 n = dataset.vertices_size
-e = dataset.edges.shape[0]
+e = dataset.edges.shape[1]
 d = dataset.vertices.shape[1]
 
 print(f"dataset {args.dataset} | num nodes {n} | num edge {e} | num node feats {d}")
@@ -98,40 +108,93 @@ for run in range(args.runs):
         if epoch % args.eval_step == 0 and epoch > 0:
             model.eval()
             with torch.no_grad():
-                _, _, weight = model(dataset.vertices, dataset.edges, args.tau)
+                _, _, weight, z_stages = model(dataset.vertices, dataset.edges, args.tau, return_z=True)
+                edge_weight = weight[-1]
+                edge_src = dataset.edges[0]
+                train_edge_mask = torch.isin(edge_src, train_idx)
+                valid_edge_mask = torch.isin(edge_src, valid_idx)
+                test_edge_mask = torch.isin(edge_src, test_idx)
 
-                train_acc = weight[-1][:,train_idx].mean().item()
-                valid_acc = weight[-1][:,valid_idx].mean().item()
-                test_acc = weight[-1][:,test_idx].mean().item()
+                # train_acc = edge_weight[:, train_edge_mask].mean().item()
+                # valid_acc = edge_weight[:, valid_edge_mask].mean().item()
+                # test_acc = edge_weight[:, test_edge_mask].mean().item()
+
+                def edge_mass(edge_weight, edge_src, mask, num_nodes):
+                    # edge_weight: [1, E] 或 [H, E]
+                    # edge_src: [E]
+                    # mask: [E]
+                    scores = edge_weight[:, mask].mean(dim=0)  # 每条边先对 head 取平均
+                    src = edge_src[mask]
+
+                    mass_per_node = torch.zeros(num_nodes, device=edge_weight.device, dtype=scores.dtype)
+                    active_node = torch.zeros(num_nodes, device=edge_weight.device, dtype=torch.bool)
+
+                    mass_per_node.scatter_add_(0, src, scores)
+                    active_node[src] = True
+
+                    return mass_per_node[active_node].mean().item()
+                
+                train_acc = edge_mass(edge_weight, edge_src, train_edge_mask, n)
+                valid_acc = edge_mass(edge_weight, edge_src, valid_edge_mask, n)
+                test_acc = edge_mass(edge_weight, edge_src, test_edge_mask, n)
+
+                maybe_plot_edge_attention(model, dataset.edges, z_stages, args.tau, run, epoch, args.seed)
+                maybe_plot_z_layers(z_stages, args.tau, run, epoch, args.seed)
+            logger.add_result(run, (train_acc, valid_acc, test_acc, loss.item()))
 
             if valid_acc > best_val:
                 best_val = valid_acc
                 if args.save_model:
                     torch.save(model.state_dict(), args.model_dir + f'{args.dataset}-{args.method}.pkl')
 
+            # print(f'Epoch: {epoch:02d}, '
+            #       f'Loss: {loss:.6f}, '
+            #       f'Train: {100 * train_acc:.4f}%, '
+            #       f'Valid: {100 * valid_acc:.4f}%, '
+            #       f'Test: {100 * test_acc:.4}%')
+
             print(f'Epoch: {epoch:02d}, '
-                  f'Loss: {loss:.4f}, '
-                  f'Train: {100 * train_acc:.2f}%, '
-                  f'Valid: {100 * valid_acc:.2f}%, '
-                  f'Test: {100 * test_acc:.2f}%')
+                f'Loss: {loss:.6f}, '
+                f'Train_mass: {train_acc:.8f}, '
+                f'Valid_mass: {valid_acc:.8f}, '
+                f'Test_mass: {test_acc:.8f}')
+
     logger.print_statistics(run)
 
 results = logger.print_statistics()
 
-def adj_mul(adj_i, adj, N):
-    adj_i_sp = torch.sparse_coo_tensor(adj_i, torch.ones(adj_i.shape[1], dtype=torch.float).to(adj.device), (N, N))
-    adj_sp = torch.sparse_coo_tensor(adj, torch.ones(adj.shape[1], dtype=torch.float).to(adj.device), (N, N))
-    adj_j = torch.sparse.mm(adj_i_sp, adj_sp)
-    adj_j = adj_j.coalesce().indices()
-    return adj_j
 
 @torch.no_grad()
 def evaluate(model, dataset, split_idx, args):
     model.eval()
-    _, _, weight = model(dataset.graph['node_feat'], dataset.graph['adjs'], args.tau)
+    _, _, weight = model(dataset.vertices, dataset.edges, args.tau)
+    edge_weight = weight[-1]
+    edge_src = dataset.edges[0]
+    train_edge_mask = torch.isin(edge_src, split_idx["train"].to(edge_src.device))
+    valid_edge_mask = torch.isin(edge_src, split_idx["valid"].to(edge_src.device))
+    test_edge_mask = torch.isin(edge_src, split_idx["test"].to(edge_src.device))
 
-    train_acc = weight[-1][split_idx['train']].mean().item()
-    valid_acc = weight[-1][split_idx['valid']].mean().item()
-    test_acc = weight[-1][split_idx['test']].mean().item()
+    # train_acc = edge_weight[:, train_edge_mask].mean().item()
+    # valid_acc = edge_weight[:, valid_edge_mask].mean().item()
+    # test_acc = edge_weight[:, test_edge_mask].mean().item()
+
+    def edge_mass(edge_weight, edge_src, mask, num_nodes):
+        # edge_weight: [1, E] 或 [H, E]
+        # edge_src: [E]
+        # mask: [E]
+        scores = edge_weight[:, mask].mean(dim=0)  # 每条边先对 head 取平均
+        src = edge_src[mask]
+
+        mass_per_node = torch.zeros(num_nodes, device=edge_weight.device, dtype=scores.dtype)
+        active_node = torch.zeros(num_nodes, device=edge_weight.device, dtype=torch.bool)
+
+        mass_per_node.scatter_add_(0, src, scores)
+        active_node[src] = True
+
+        return mass_per_node[active_node].mean().item()
+    
+    train_acc = edge_mass(edge_weight, edge_src, train_edge_mask, n)
+    valid_acc = edge_mass(edge_weight, edge_src, valid_edge_mask, n)
+    test_acc = edge_mass(edge_weight, edge_src, test_edge_mask, n)
 
     return train_acc, valid_acc, test_acc

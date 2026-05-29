@@ -11,6 +11,8 @@ def parser_add_main_args(parser):
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--eval_step', type=int,
                         default=1, help='how often to print')
+    parser.add_argument('--debug', action='store_true', help='print intermediate tensor statistics for debugging')
+    parser.add_argument('--debug_step', type=int, default=50, help='how often to print debug information')
     parser.add_argument('--cpu', action='store_true')
     parser.add_argument('--runs', type=int, default=1,
                         help='number of distinct runs')

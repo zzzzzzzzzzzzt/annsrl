@@ -172,7 +172,10 @@ def kernelized_gumbel_softmax(query, key, value, kernel_transformation, projecti
 
     # compute updated node emb, this step requires O(N)
     gumbels = (
-        -torch.empty(key_prime.shape[:-1]+(K, ), memory_format=torch.legacy_contiguous_format).exponential_().log()
+        -torch.empty(key_prime.shape[:-1]+(K, ), memory_format=torch.legacy_contiguous_format)
+        .exponential_()
+        .clamp_min(1e-12)
+        .log()
     ).to(query.device) / tau # [N, B, H, K]
     key_t_gumbel = key_prime.unsqueeze(3) * gumbels.exp().unsqueeze(4) # [N, B, H, K, M]
     z_num = numerator_gumbel(query_prime, key_t_gumbel, value) # [N, B, H, K, D]
@@ -316,6 +319,8 @@ class NodeFormer(nn.Module):
         self.fcs.append(nn.Linear(in_channels, hidden_channels))
         self.bns = nn.ModuleList()
         self.bns.append(nn.LayerNorm(hidden_channels))
+        # self.link_W1 = nn.Parameter(torch.empty(hidden_channels, hidden_channels))
+        # self.link_W2 = nn.Parameter(torch.empty(hidden_channels, hidden_channels))
         for i in range(num_layers):
             self.convs.append(
                 NodeFormerConv(hidden_channels, hidden_channels, num_heads=num_heads, kernel_transformation=kernel_transformation,
@@ -335,6 +340,9 @@ class NodeFormer(nn.Module):
         self.use_act = use_act
         self.use_jk = use_jk
         self.use_edge_loss = use_edge_loss
+        self.kernel_transformation = kernel_transformation
+        self.nb_random_features = nb_random_features
+        self.use_gumbel = use_gumbel
 
     def reset_parameters(self):
         for conv in self.convs:
@@ -343,19 +351,54 @@ class NodeFormer(nn.Module):
             bn.reset_parameters()
         for fc in self.fcs:
             fc.reset_parameters()
+        # nn.init.xavier_uniform_(self.link_W1)
+        # nn.init.xavier_uniform_(self.link_W2)
 
-    def forward(self, x, adjs, tau=1.0):
+    def _compute_global_link_loss(self, z, adjs, tau):
+        row, col = adjs[0]
+        query = z.unsqueeze(2) / math.sqrt(tau)
+        key = z.unsqueeze(2) / math.sqrt(tau)
+        # query = torch.matmul(z, self.link_W1).unsqueeze(2) / math.sqrt(tau)
+        # key = torch.matmul(z, self.link_W2.t()).unsqueeze(2) / math.sqrt(tau)
+
+        dim = query.shape[-1]
+        seed = torch.ceil(torch.abs(torch.sum(query) * BIG_CONSTANT)).to(torch.int32)
+        projection_matrix = create_projection_matrix(self.nb_random_features, dim, seed=seed).to(query.device)
+
+        query_prime = self.kernel_transformation(query, True, projection_matrix)
+        key_prime = self.kernel_transformation(key, False, projection_matrix)
+        if self.training and self.use_gumbel:
+            gumbel = -torch.empty(key_prime.shape[:-1], memory_format=torch.legacy_contiguous_format,
+                                  device=key_prime.device).exponential_().clamp_min(1e-12).log()
+            key_prime = key_prime * torch.exp(gumbel / tau).unsqueeze(-1)
+
+        key_sum = key_prime.sum(dim=1)
+        edge_pi_num = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
+        edge_pi_den = (query_prime[:, row] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
+        edge_pi = edge_pi_num / edge_pi_den.clamp_min(1e-30)
+
+        d_out = degree(row, query.shape[1]).float()
+        d_norm = 1. / d_out[row]
+        edge_pi = edge_pi.clamp_min(1e-30)
+        link_loss = edge_pi.log() * d_norm.reshape(1, -1)
+        return link_loss, edge_pi
+
+    def forward(self, x, adjs, tau=1.0, return_z=False):
         x = x.unsqueeze(0) # [B, N, H, D], B=1 denotes number of graph
         adjs = adjs.unsqueeze(0)
         layer_ = []
         link_loss_ = []
         weight_ = []
+        z_stages = {} if return_z else None
+
         z = self.fcs[0](x)
         if self.use_bn:
             z = self.bns[0](z)
         z = self.activation(z)
         z = F.dropout(z, p=self.dropout, training=self.training)
         layer_.append(z)
+        if return_z:
+            z_stages["input_z"] = z
 
         for i, conv in enumerate(self.convs):
             if self.use_edge_loss:
@@ -372,6 +415,12 @@ class NodeFormer(nn.Module):
                 z = self.activation(z)
             z = F.dropout(z, p=self.dropout, training=self.training)
             layer_.append(z)
+            if return_z:
+                z_stages[f"after_layer{i}"] = z
+        if self.use_edge_loss:
+            global_link_loss, global_weight = self._compute_global_link_loss(z, adjs, tau)
+            link_loss_.append(global_link_loss)
+            weight_.append(global_weight)
 
         if self.use_jk: # use jk connection for each layer
             z = torch.cat(layer_, dim=-1)
@@ -379,6 +428,10 @@ class NodeFormer(nn.Module):
         x_out = self.fcs[-1](z).squeeze(0)
 
         if self.use_edge_loss:
+            if return_z:
+                return x_out, link_loss_, weight_, z_stages
             return x_out, link_loss_, weight_
         else:
+            if return_z:
+                return x_out, z_stages
             return x_out
