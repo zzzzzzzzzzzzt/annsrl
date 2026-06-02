@@ -91,13 +91,23 @@ def _conv_gumbel_distribution(model, z, edge_index, tau, source, layer_idx, seed
     query_prime = conv.kernel_transformation(query_scaled, True, projection_matrix).permute(1, 0, 2, 3)
     key_prime = conv.kernel_transformation(key_scaled, False, projection_matrix).permute(1, 0, 2, 3)
 
-    # Use one deterministic Gumbel draw for the fixed source, then average the
-    # resulting source->candidate distributions over heads and K samples.
+    # Use one deterministic Gumbel draw and average both directions for the
+    # fixed source-candidate pair.
     gumbel = _sample_gumbel((num_nodes, bsz, conv.num_heads, conv.nb_gumbel_sample), seed, device) / tau
+    key_t_gumbel = key_prime.unsqueeze(3) * gumbel.exp().unsqueeze(-1)  # [N, B, H, K, M]
+    key_sum = key_t_gumbel.sum(dim=0)  # [B, H, K, M]
+
     query_source = query_prime[source]  # [B, H, M]
-    scores = (query_source.unsqueeze(2).unsqueeze(0) * key_prime.unsqueeze(3)).sum(dim=-1)  # [N, B, H, K]
-    logits = scores.clamp_min(1e-45).log() + gumbel
-    probs = torch.softmax(logits, dim=0)
+    source_to_candidate_num = torch.einsum("bhm,nbhkm->nbhk", query_source, key_t_gumbel)
+    source_to_candidate_den = torch.einsum("bhm,bhkm->bhk", query_source, key_sum).unsqueeze(0)
+    source_to_candidate = source_to_candidate_num / source_to_candidate_den.clamp_min(1e-30)
+
+    key_source = key_t_gumbel[source]  # [B, H, K, M]
+    candidate_to_source_num = torch.einsum("nbhm,bhkm->nbhk", query_prime, key_source)
+    candidate_to_source_den = torch.einsum("nbhm,bhkm->nbhk", query_prime, key_sum)
+    candidate_to_source = candidate_to_source_num / candidate_to_source_den.clamp_min(1e-30)
+
+    probs = 0.5 * (source_to_candidate + candidate_to_source)
     return probs[:, 0].mean(dim=(1, 2))
 
 
@@ -113,9 +123,18 @@ def _global_gumbel_distribution(model, z, tau, source, seed):
     key_prime = model.kernel_transformation(key, False, projection_matrix)[0, :, 0]
     gumbel = _sample_gumbel((key_prime.shape[0],), seed, device) / tau
 
-    scores = (query_prime[source].unsqueeze(0) * key_prime).sum(dim=-1)
-    logits = scores.clamp_min(1e-45).log() + gumbel
-    return _safe_softmax(logits)
+    key_t_gumbel = key_prime * gumbel.exp().unsqueeze(-1)
+    key_sum = key_t_gumbel.sum(dim=0)
+
+    source_to_candidate_num = (query_prime[source].unsqueeze(0) * key_t_gumbel).sum(dim=-1)
+    source_to_candidate_den = (query_prime[source] * key_sum).sum(dim=-1)
+    source_to_candidate = source_to_candidate_num / source_to_candidate_den.clamp_min(1e-30)
+
+    candidate_to_source_num = (query_prime * key_t_gumbel[source].unsqueeze(0)).sum(dim=-1)
+    candidate_to_source_den = (query_prime * key_sum.unsqueeze(0)).sum(dim=-1)
+    candidate_to_source = candidate_to_source_num / candidate_to_source_den.clamp_min(1e-30)
+
+    return 0.5 * (source_to_candidate + candidate_to_source)
 
 
 def _distribution_stats(values):
@@ -197,9 +216,9 @@ def _write_attention_svg(path, panels, source, tau, topk):
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n'
         '<rect width="100%" height="100%" fill="#ffffff" />\n'
         f'<text x="{margin_x}" y="34" font-size="22" font-weight="700">Gumbel attention snapshot: fixed i={source}, tau={tau:.2f}</text>\n'
-        f'<text x="{margin_x}" y="64" font-size="13">Conv panels show the red-box attention weight in each NodeFormer layer; the right panel shows global_gumbel.</text>\n'
+        f'<text x="{margin_x}" y="64" font-size="13">Conv panels show bidirectional edge attention in each NodeFormer layer; the right panel shows global_gumbel.</text>\n'
         f'<text x="{margin_x}" y="84" font-size="13">Each panel sorts all candidate j by probability and displays top-{topk}. Orange means existing outgoing edge i -> j.</text>\n'
-        f'<text x="{margin_x}" y="104" font-size="13">Conv panels average the red-box weights over heads and K Gumbel samples.</text>\n'
+        f'<text x="{margin_x}" y="104" font-size="13">Weights average both directions, then average over heads and K Gumbel samples.</text>\n'
         f'{chr(10).join(panel_svg)}\n'
         f'<rect x="{margin_x}" y="{legend_y}" width="14" height="14" fill="#f97316" />\n'
         f'<text x="{margin_x + 22}" y="{legend_y + 12}" font-size="13">existing edge</text>\n'
@@ -219,7 +238,7 @@ def maybe_plot_edge_attention(model, edge_index, z_stages, tau, run, epoch, seed
     count = _env_int("PLOT_EDGE_PI_NODES", 3)
     snapshot_seed = seed + run * 1000003 + epoch * 9176
     sources = _sample_sources(num_nodes, count, snapshot_seed + 811)
-    output_dir = Path(os.environ.get("PLOT_EDGE_PI_DIR", "results/z_viz2")) / f"tau_{tau:.2f}" / "attention_svg"
+    output_dir = Path(os.environ.get("PLOT_EDGE_PI_DIR", "results/z_viz/All_data_cross_loss")) / f"tau_{tau:.2f}" / "attention_svg"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths = []
