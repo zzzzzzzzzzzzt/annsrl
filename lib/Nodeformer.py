@@ -140,13 +140,19 @@ def kernelized_softmax(query, key, value, kernel_transformation, projection_matr
 
     if return_weight: # query edge prob for computing edge-level reg loss, this step requires O(E)
         start, end = edge_index
-        query_end, key_start = query_prime[end], key_prime[start] # [E, B, H, M]
-        edge_attn_num = torch.einsum("ebhm,ebhm->ebh", query_end, key_start) # [E, B, H]
-        edge_attn_num = edge_attn_num.permute(1, 0, 2) # [B, E, H]
         attn_normalizer = denominator(query_prime, key_prime) # [N, B, H]
-        edge_attn_dem = attn_normalizer[end]  # [E, B, H]
-        edge_attn_dem = edge_attn_dem.permute(1, 0, 2) # [B, E, H]
-        A_weight = edge_attn_num / edge_attn_dem # [B, E, H]
+
+        query_end, key_start = query_prime[end], key_prime[start] # [E, B, H, M]
+        end_to_start_num = torch.einsum("ebhm,ebhm->ebh", query_end, key_start) # [E, B, H]
+        end_to_start_den = attn_normalizer[end]  # [E, B, H]
+        end_to_start = (end_to_start_num / end_to_start_den.clamp_min(1e-30)).permute(1, 0, 2) # [B, E, H]
+
+        query_start, key_end = query_prime[start], key_prime[end] # [E, B, H, M]
+        start_to_end_num = torch.einsum("ebhm,ebhm->ebh", query_start, key_end) # [E, B, H]
+        start_to_end_den = attn_normalizer[start]  # [E, B, H]
+        start_to_end = (start_to_end_num / start_to_end_den.clamp_min(1e-30)).permute(1, 0, 2) # [B, E, H]
+
+        A_weight = 0.5 * (end_to_start + start_to_end) # [B, E, H]
 
         return z_output, A_weight
 
@@ -188,13 +194,19 @@ def kernelized_gumbel_softmax(query, key, value, kernel_transformation, projecti
 
     if return_weight: # query edge prob for computing edge-level reg loss, this step requires O(E)
         start, end = edge_index
-        query_end, key_start = query_prime[end], key_prime[start] # [E, B, H, M]
-        edge_attn_num = torch.einsum("ebhm,ebhm->ebh", query_end, key_start) # [E, B, H]
-        edge_attn_num = edge_attn_num.permute(1, 0, 2) # [B, E, H]
         attn_normalizer = denominator(query_prime, key_prime) # [N, B, H]
-        edge_attn_dem = attn_normalizer[end]  # [E, B, H]
-        edge_attn_dem = edge_attn_dem.permute(1, 0, 2) # [B, E, H]
-        A_weight = edge_attn_num / edge_attn_dem # [B, E, H]
+
+        query_end, key_start = query_prime[end], key_prime[start] # [E, B, H, M]
+        end_to_start_num = torch.einsum("ebhm,ebhm->ebh", query_end, key_start) # [E, B, H]
+        end_to_start_den = attn_normalizer[end]  # [E, B, H]
+        end_to_start = (end_to_start_num / end_to_start_den.clamp_min(1e-30)).permute(1, 0, 2) # [B, E, H]
+
+        query_start, key_end = query_prime[start], key_prime[end] # [E, B, H, M]
+        start_to_end_num = torch.einsum("ebhm,ebhm->ebh", query_start, key_end) # [E, B, H]
+        start_to_end_den = attn_normalizer[start]  # [E, B, H]
+        start_to_end = (start_to_end_num / start_to_end_den.clamp_min(1e-30)).permute(1, 0, 2) # [B, E, H]
+
+        A_weight = 0.5 * (end_to_start + start_to_end) # [B, E, H]
 
         return z_output, A_weight
 
@@ -294,10 +306,11 @@ class NodeFormerConv(nn.Module):
 
         if self.use_edge_loss: # compute edge regularization loss on input adjacency
             row, col = adjs[0]
-            d_in = degree(col, query.shape[1]).float()
-            d_norm = 1. / d_in[col]
+            d_out = degree(row, query.shape[1]).float().clamp_min(1)
+            d_in = degree(col, query.shape[1]).float().clamp_min(1)
+            d_norm = 0.5 * (1. / d_out[row] + 1. / d_in[col])
             d_norm_ = d_norm.reshape(1, -1, 1).repeat(1, 1, weight.shape[-1])
-            link_loss = weight.log() * d_norm_
+            link_loss = weight.clamp_min(1e-30).log() * d_norm_
 
             return z_next, link_loss, weight
 
@@ -373,12 +386,19 @@ class NodeFormer(nn.Module):
             key_prime = key_prime * torch.exp(gumbel / tau).unsqueeze(-1)
 
         key_sum = key_prime.sum(dim=1)
-        edge_pi_num = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
-        edge_pi_den = (query_prime[:, row] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
-        edge_pi = edge_pi_num / edge_pi_den.clamp_min(1e-30)
+        row_to_col_num = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
+        row_to_col_den = (query_prime[:, row] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
+        row_to_col = row_to_col_num / row_to_col_den.clamp_min(1e-30)
 
-        d_out = degree(row, query.shape[1]).float()
-        d_norm = 1. / d_out[row]
+        col_to_row_num = (query_prime[:, col] * key_prime[:, row]).sum(dim=-1).squeeze(-1)
+        col_to_row_den = (query_prime[:, col] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
+        col_to_row = col_to_row_num / col_to_row_den.clamp_min(1e-30)
+
+        edge_pi = 0.5 * (row_to_col + col_to_row)
+
+        d_out = degree(row, query.shape[1]).float().clamp_min(1)
+        d_in = degree(col, query.shape[1]).float().clamp_min(1)
+        d_norm = 0.5 * (1. / d_out[row] + 1. / d_in[col])
         edge_pi = edge_pi.clamp_min(1e-30)
         link_loss = edge_pi.log() * d_norm.reshape(1, -1)
         return link_loss, edge_pi
