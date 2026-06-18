@@ -7,6 +7,23 @@ from torch_sparse import SparseTensor, matmul
 from torch_geometric.utils import degree
 
 BIG_CONSTANT = 1e8
+GUMBEL_EPS = 1e-12
+
+
+def stable_gumbel_exp(shape, tau, device, normalize_dim):
+    if tau <= 0:
+        raise ValueError("tau must be positive for Gumbel sampling")
+
+    gumbel = (
+        -torch.empty(shape, memory_format=torch.legacy_contiguous_format)
+        .exponential_()
+        .clamp_min(GUMBEL_EPS)
+        .log()
+    ).to(device) / tau
+    # The common shift cancels in attention ratios, but keeps exp finite.
+    gumbel = gumbel - gumbel.max(dim=normalize_dim, keepdim=True)[0]
+    return gumbel.exp()
+
 
 def create_projection_matrix(m, d, seed=0, scaling=0, struct_mode=False):
     nb_full_blocks = int(m/d)
@@ -177,13 +194,10 @@ def kernelized_gumbel_softmax(query, key, value, kernel_transformation, projecti
     value = value.permute(1, 0, 2, 3) # [N, B, H, D]
 
     # compute updated node emb, this step requires O(N)
-    gumbels = (
-        -torch.empty(key_prime.shape[:-1]+(K, ), memory_format=torch.legacy_contiguous_format)
-        .exponential_()
-        .clamp_min(1e-12)
-        .log()
-    ).to(query.device) / tau # [N, B, H, K]
-    key_t_gumbel = key_prime.unsqueeze(3) * gumbels.exp().unsqueeze(4) # [N, B, H, K, M]
+    gumbel_weights = stable_gumbel_exp(
+        key_prime.shape[:-1] + (K,), tau, query.device, normalize_dim=0
+    ) # [N, B, H, K]
+    key_t_gumbel = key_prime.unsqueeze(3) * gumbel_weights.unsqueeze(4) # [N, B, H, K, M]
     z_num = numerator_gumbel(query_prime, key_t_gumbel, value) # [N, B, H, K, D]
     z_den = denominator_gumbel(query_prime, key_t_gumbel) # [N, B, H, K]
 
@@ -381,9 +395,10 @@ class NodeFormer(nn.Module):
         query_prime = self.kernel_transformation(query, True, projection_matrix)
         key_prime = self.kernel_transformation(key, False, projection_matrix)
         if self.training and self.use_gumbel:
-            gumbel = -torch.empty(key_prime.shape[:-1], memory_format=torch.legacy_contiguous_format,
-                                  device=key_prime.device).exponential_().clamp_min(1e-12).log()
-            key_prime = key_prime * torch.exp(gumbel / tau).unsqueeze(-1)
+            gumbel_weights = stable_gumbel_exp(
+                key_prime.shape[:-1], tau, key_prime.device, normalize_dim=1
+            )
+            key_prime = key_prime * gumbel_weights.unsqueeze(-1)
 
         key_sum = key_prime.sum(dim=1)
         row_to_col_num = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)

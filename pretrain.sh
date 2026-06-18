@@ -1,4 +1,4 @@
-python pretrain.py --dataset sift100k --graph_type nsw \
+python pretrain.py --dataset DEEP100K --graph_type nsw \
 --vertices_path data/DEEP100K/deep_base.fvecs \
 --edges_path data/DEEP100K/deep_hnsw_M12_efC300.ivecs \
 --rand_split --method nodeformer --lr 0.005 \
