@@ -305,11 +305,15 @@ class NodeFormerConv(nn.Module):
         adj_index = None if adjs is None else adjs[0]
         # compute all-pair message passing update and attn weight on input edges, requires O(N) or O(N + E)
         if self.use_gumbel and self.training:  # only using Gumbel noise for training
-            z_next, weight = kernelized_gumbel_softmax(query,key,value,self.kernel_transformation,projection_matrix, adj_index,
-                                                  self.nb_gumbel_sample, tau, self.use_edge_loss)
+            conv_out = kernelized_gumbel_softmax(query, key, value, self.kernel_transformation, projection_matrix, adj_index,
+                                                 self.nb_gumbel_sample, tau, self.use_edge_loss)
         else:
-            z_next, weight = kernelized_softmax(query, key, value, self.kernel_transformation, projection_matrix, adj_index,
-                                                tau, self.use_edge_loss)
+            conv_out = kernelized_softmax(query, key, value, self.kernel_transformation, projection_matrix, adj_index,
+                                          tau, self.use_edge_loss)
+        if self.use_edge_loss:
+            z_next, weight = conv_out
+        else:
+            z_next = conv_out
 
         # compute update by relational bias of input adjacency, requires O(E)
         for i in range(self.rb_order):
@@ -332,33 +336,36 @@ class NodeFormerConv(nn.Module):
             return z_next
 
 class NodeFormer(nn.Module):
-    '''
-    NodeFormer model implementation
-    return: predicted node labels, a list of edge losses at every layer
-    '''
+    """
+    NodeFormer first encodes topology features U, then gates the original
+    coordinates x with U and predicts edges from the fused representation.
+    """
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, num_heads=4, dropout=0.0,
                  kernel_transformation=softmax_kernel_transformation, nb_random_features=30, use_bn=True, use_gumbel=True,
-                 use_residual=True, use_act=False, use_jk=False, nb_gumbel_sample=10, rb_order=0, rb_trans='sigmoid', use_edge_loss=True):
+                 use_residual=True, use_act=False, use_jk=False, nb_gumbel_sample=10, rb_order=0, rb_trans='sigmoid',
+                 use_edge_loss=True, sample_hop=2, mass_alpha=0.0):
         super(NodeFormer, self).__init__()
 
+        self.input_proj = nn.Linear(in_channels, hidden_channels)
         self.convs = nn.ModuleList()
-        self.fcs = nn.ModuleList()
-        self.fcs.append(nn.Linear(in_channels, hidden_channels))
-        self.bns = nn.ModuleList()
-        self.bns.append(nn.LayerNorm(hidden_channels))
-        # self.link_W1 = nn.Parameter(torch.empty(hidden_channels, hidden_channels))
-        # self.link_W2 = nn.Parameter(torch.empty(hidden_channels, hidden_channels))
-        for i in range(num_layers):
+        self.bns = nn.ModuleList([nn.LayerNorm(hidden_channels)])
+        for _ in range(num_layers):
             self.convs.append(
-                NodeFormerConv(hidden_channels, hidden_channels, num_heads=num_heads, kernel_transformation=kernel_transformation,
-                              nb_random_features=nb_random_features, use_gumbel=use_gumbel, nb_gumbel_sample=nb_gumbel_sample,
-                               rb_order=rb_order, rb_trans=rb_trans, use_edge_loss=use_edge_loss))
+                NodeFormerConv(hidden_channels, hidden_channels, num_heads=num_heads,
+                               kernel_transformation=kernel_transformation,
+                               nb_random_features=nb_random_features,
+                               use_gumbel=use_gumbel,
+                               nb_gumbel_sample=nb_gumbel_sample,
+                               rb_order=rb_order,
+                               rb_trans=rb_trans,
+                               use_edge_loss=False))
             self.bns.append(nn.LayerNorm(hidden_channels))
 
-        if use_jk:
-            self.fcs.append(nn.Linear(hidden_channels * num_layers + hidden_channels, out_channels))
-        else:
-            self.fcs.append(nn.Linear(hidden_channels, out_channels))
+        topology_dim = hidden_channels * (num_layers + 1) if use_jk else hidden_channels
+        self.output_proj = nn.Linear(topology_dim, out_channels)
+        self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels), nn.Sigmoid())
+        self.link_query = nn.Linear(in_channels, hidden_channels, bias=False)
+        self.link_key = nn.Linear(in_channels, hidden_channels, bias=False)
 
         self.dropout = dropout
         self.activation = F.elu
@@ -370,23 +377,61 @@ class NodeFormer(nn.Module):
         self.kernel_transformation = kernel_transformation
         self.nb_random_features = nb_random_features
         self.use_gumbel = use_gumbel
+        if sample_hop < 2:
+            raise ValueError("sample_hop must be at least 2")
+        self.sample_hop = sample_hop
+        self.mass_alpha = mass_alpha
 
     def reset_parameters(self):
+        self.input_proj.reset_parameters()
+        self.output_proj.reset_parameters()
         for conv in self.convs:
             conv.reset_parameters()
         for bn in self.bns:
             bn.reset_parameters()
-        for fc in self.fcs:
-            fc.reset_parameters()
-        # nn.init.xavier_uniform_(self.link_W1)
-        # nn.init.xavier_uniform_(self.link_W2)
+        for module in self.feature_gate:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+        self.link_query.reset_parameters()
+        self.link_key.reset_parameters()
 
-    def _compute_global_link_loss(self, z, adjs, tau):
-        row, col = adjs[0]
-        query = z.unsqueeze(2) / math.sqrt(tau)
-        key = z.unsqueeze(2) / math.sqrt(tau)
-        # query = torch.matmul(z, self.link_W1).unsqueeze(2) / math.sqrt(tau)
-        # key = torch.matmul(z, self.link_W2.t()).unsqueeze(2) / math.sqrt(tau)
+    def _encode_topology(self, x, adjs, tau, z_stages=None):
+        topology = self.input_proj(x)
+        if self.use_bn:
+            topology = self.bns[0](topology)
+        topology = self.activation(topology)
+        topology = F.dropout(topology, p=self.dropout, training=self.training)
+
+        layers = [topology]
+        if z_stages is not None:
+            z_stages["input_z"] = topology
+
+        for i, conv in enumerate(self.convs):
+            next_topology = conv(topology, adjs, tau)
+            if self.use_residual:
+                next_topology = next_topology + layers[i]
+            if self.use_bn:
+                next_topology = self.bns[i + 1](next_topology)
+            if self.use_act:
+                next_topology = self.activation(next_topology)
+            next_topology = F.dropout(next_topology, p=self.dropout, training=self.training)
+
+            topology = next_topology
+            layers.append(topology)
+            if z_stages is not None:
+                z_stages[f"after_layer{i}"] = topology
+
+        if self.use_jk:
+            topology = torch.cat(layers, dim=-1)
+        return topology
+
+    def _fuse_features(self, x, topology):
+        gate = self.feature_gate(topology)
+        return x * gate + x
+
+    def _link_kernel(self, fused_z, tau):
+        query = self.link_query(fused_z).unsqueeze(2) / math.sqrt(tau)
+        key = self.link_key(fused_z).unsqueeze(2) / math.sqrt(tau)
 
         dim = query.shape[-1]
         seed = torch.ceil(torch.abs(torch.sum(query) * BIG_CONSTANT)).to(torch.int32)
@@ -399,74 +444,102 @@ class NodeFormer(nn.Module):
                 key_prime.shape[:-1], tau, key_prime.device, normalize_dim=1
             )
             key_prime = key_prime * gumbel_weights.unsqueeze(-1)
+        return query_prime, key_prime
 
+    def _edge_prob(self, query_prime, key_prime, edge_index):
+        row, col = edge_index
         key_sum = key_prime.sum(dim=1)
-        row_to_col_num = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
-        row_to_col_den = (query_prime[:, row] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
-        row_to_col = row_to_col_num / row_to_col_den.clamp_min(1e-30)
+        numerator = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
+        denominator = (query_prime[:, row] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
+        return numerator / denominator.clamp_min(1e-30)
 
-        col_to_row_num = (query_prime[:, col] * key_prime[:, row]).sum(dim=-1).squeeze(-1)
-        col_to_row_den = (query_prime[:, col] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
-        col_to_row = col_to_row_num / col_to_row_den.clamp_min(1e-30)
+    def _h_hop_negative_edges(self, edge_index, num_nodes):
+        row, col = edge_index
+        value = torch.ones(row.numel(), device=edge_index.device)
+        adj = torch.sparse_coo_tensor(edge_index, value, (num_nodes, num_nodes)).coalesce()
+        hop_adj = adj
+        for _ in range(self.sample_hop - 1):
+            hop_adj = torch.sparse.mm(hop_adj, adj).coalesce()
+        hop_edges = hop_adj.indices()
 
-        edge_pi = 0.5 * (row_to_col + col_to_row)
+        neg_row, neg_col = hop_edges
+        neg_id = neg_row * num_nodes + neg_col
+        pos_id = (row * num_nodes + col).unique()
+        mask = (neg_row != neg_col) & ~torch.isin(neg_id, pos_id)
+        return hop_edges[:, mask]
 
-        d_out = degree(row, query.shape[1]).float().clamp_min(1)
-        d_in = degree(col, query.shape[1]).float().clamp_min(1)
-        d_norm = 0.5 * (1. / d_out[row] + 1. / d_in[col])
-        edge_pi = edge_pi.clamp_min(1e-30)
-        link_loss = edge_pi.log() * d_norm.reshape(1, -1)
-        return link_loss, edge_pi
+    def _positive_mass(self, pos_prob, pos_edges, num_nodes):
+        pos_src = pos_edges[0]
+        pos_mass = torch.zeros(pos_prob.shape[0], num_nodes, device=pos_prob.device, dtype=pos_prob.dtype)
+        pos_mass.scatter_add_(1, pos_src.unsqueeze(0).expand(pos_prob.shape[0], -1), pos_prob)
+        active = pos_mass > 0
+        if not active.any():
+            return pos_prob.sum() * 0
+        return pos_mass[active].mean()
+
+    def _contrastive_loss(self, query_prime, key_prime, pos_edges):
+        num_nodes = query_prime.shape[1]
+        neg_edges = self._h_hop_negative_edges(pos_edges, num_nodes)
+        pos_prob = self._edge_prob(query_prime, key_prime, pos_edges).clamp_min(1e-30)
+        pos_mass = self._positive_mass(pos_prob, pos_edges, num_nodes)
+
+        if neg_edges.numel() == 0:
+            contrastive_loss = pos_prob.sum() * 0
+            return contrastive_loss - self.mass_alpha * pos_mass.clamp_min(1e-30).log()
+
+        neg_prob = self._edge_prob(query_prime, key_prime, neg_edges).clamp_min(1e-30)
+        neg_src = neg_edges[0]
+        neg_mass = torch.zeros(query_prime.shape[0], num_nodes, device=query_prime.device, dtype=neg_prob.dtype)
+        neg_mass.scatter_add_(1, neg_src.unsqueeze(0).expand(query_prime.shape[0], -1), neg_prob)
+
+        pos_src = pos_edges[0]
+        pos_neg_mass = neg_mass[:, pos_src]
+        valid = pos_neg_mass > 0
+        if not valid.any():
+            return pos_prob.sum() * 0
+
+        edge_loss = -(pos_prob.log() - (pos_prob + pos_neg_mass).clamp_min(1e-30).log())
+        edge_loss = torch.where(valid, edge_loss, torch.zeros_like(edge_loss))
+
+        center_loss = torch.zeros(query_prime.shape[0], num_nodes, device=query_prime.device, dtype=edge_loss.dtype)
+        center_count = torch.zeros_like(center_loss)
+        src_index = pos_src.unsqueeze(0).expand(query_prime.shape[0], -1)
+        center_loss.scatter_add_(1, src_index, edge_loss)
+        center_count.scatter_add_(1, src_index, valid.to(edge_loss.dtype))
+
+        center_valid = center_count > 0
+        center_loss = center_loss / center_count.clamp_min(1)
+        contrastive_loss = center_loss[center_valid].mean()
+        return contrastive_loss - self.mass_alpha * pos_mass.clamp_min(1e-30).log()
 
     def forward(self, x, adjs, tau=1.0, return_z=False):
-        x = x.unsqueeze(0) # [B, N, H, D], B=1 denotes number of graph
-        adjs = adjs.unsqueeze(0)
-        layer_ = []
-        link_loss_ = []
-        weight_ = []
+        x = x.unsqueeze(0)
+        adjs = adjs.unsqueeze(0) if adjs is not None else None
         z_stages = {} if return_z else None
 
-        z = self.fcs[0](x)
-        if self.use_bn:
-            z = self.bns[0](z)
-        z = self.activation(z)
-        z = F.dropout(z, p=self.dropout, training=self.training)
-        layer_.append(z)
-        if return_z:
-            z_stages["input_z"] = z
+        topology = self._encode_topology(x, adjs, tau, z_stages)
+        x_out = self.output_proj(topology).squeeze(0)
 
-        for i, conv in enumerate(self.convs):
-            if self.use_edge_loss:
-                z, link_loss, weight = conv(z, adjs, tau)
-                link_loss_.append(link_loss)
-                weight_.append(weight)
-            else:
-                z = conv(z, adjs, tau)
-            if self.use_residual:
-                z += layer_[i]
-            if self.use_bn:
-                z = self.bns[i+1](z)
-            if self.use_act:
-                z = self.activation(z)
-            z = F.dropout(z, p=self.dropout, training=self.training)
-            layer_.append(z)
-            if return_z:
-                z_stages[f"after_layer{i}"] = z
-        if self.use_edge_loss:
-            global_link_loss, global_weight = self._compute_global_link_loss(z, adjs, tau)
-            link_loss_.append(global_link_loss)
-            weight_.append(global_weight)
-
-        if self.use_jk: # use jk connection for each layer
-            z = torch.cat(layer_, dim=-1)
-
-        x_out = self.fcs[-1](z).squeeze(0)
-
-        if self.use_edge_loss:
-            if return_z:
-                return x_out, link_loss_, weight_, z_stages
-            return x_out, link_loss_, weight_
-        else:
+        if not self.use_edge_loss:
             if return_z:
                 return x_out, z_stages
             return x_out
+        if adjs is None:
+            raise ValueError("edge_index is required when use_edge_loss=True")
+
+        fused_z = self._fuse_features(x, topology)
+        if z_stages is not None:
+            z_stages["fused_z"] = fused_z
+
+        query_prime, key_prime = self._link_kernel(fused_z, tau)
+        edge_weight = self._edge_prob(query_prime, key_prime, adjs[0]).clamp_min(1e-30)
+        if self.training:
+            contrastive_loss = self._contrastive_loss(query_prime, key_prime, adjs[0])
+        else:
+            contrastive_loss = edge_weight.sum() * 0
+
+        losses = [contrastive_loss]
+        weights = [edge_weight]
+        if return_z:
+            return x_out, losses, weights, z_stages
+        return x_out, losses, weights

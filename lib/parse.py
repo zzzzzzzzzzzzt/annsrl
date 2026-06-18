@@ -49,12 +49,18 @@ def parser_add_main_args(parser):
     parser.add_argument('--use_act', action='store_true', help='use non-linearity for each layer')
     parser.add_argument('--use_jk', action='store_true', help='concat the layer-wise results in the final layer')
     parser.add_argument('--K', type=int, default=10, help='num of samples for gumbel softmax sampling')
-    parser.add_argument('--tau', type=float, default=0.25, help='temperature for gumbel softmax')
+    parser.add_argument('--tau', type=float, default=0.25, help='initial temperature for gumbel softmax')
+    parser.add_argument('--tau_min', type=float, default=None,
+                        help='final temperature for linear annealing; keep fixed when omitted')
     parser.add_argument('--lamda', type=float, default=0.1, help='weight for edge reg loss')
     parser.add_argument('--rb_order', type=int, default=0, help='order for relational bias, 0 for not use')
     parser.add_argument('--rb_trans', type=str, default='sigmoid', choices=['sigmoid', 'identity'],
                         help='non-linearity for relational bias')
     parser.add_argument('--batch_size', type=int, default=10000)
+    parser.add_argument('--sample_hop', type=int, default=2,
+                        help='hop distance used to collect non-neighbor negatives')
+    parser.add_argument('--mass_alpha', type=float, default=0.0,
+                        help='weight for the positive edge mass bonus in pretraining loss')
 
     # hyper-parameter for gnn baseline
     parser.add_argument('--hops', type=int, default=1,
