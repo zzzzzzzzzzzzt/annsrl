@@ -53,11 +53,13 @@ def _safe_softmax(logits):
     return torch.softmax(logits, dim=0)
 
 
-def _sample_gumbel(shape, seed, device):
+def _sample_gumbel_weights(shape, seed, device, tau, normalize_dim):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     sample = torch.empty(shape, memory_format=torch.legacy_contiguous_format)
     sample.exponential_(generator=generator)
-    return -sample.clamp_min(1e-12).log().to(device)
+    gumbel = -sample.clamp_min(1e-12).log().to(device) / tau
+    gumbel = gumbel - gumbel.max(dim=normalize_dim, keepdim=True)[0]
+    return gumbel.exp()
 
 
 def _sample_sources(num_nodes, count, seed):
@@ -93,8 +95,14 @@ def _conv_gumbel_distribution(model, z, edge_index, tau, source, layer_idx, seed
 
     # Use one deterministic Gumbel draw and average both directions for the
     # fixed source-candidate pair.
-    gumbel = _sample_gumbel((num_nodes, bsz, conv.num_heads, conv.nb_gumbel_sample), seed, device) / tau
-    key_t_gumbel = key_prime.unsqueeze(3) * gumbel.exp().unsqueeze(-1)  # [N, B, H, K, M]
+    gumbel_weights = _sample_gumbel_weights(
+        (num_nodes, bsz, conv.num_heads, conv.nb_gumbel_sample),
+        seed,
+        device,
+        tau,
+        normalize_dim=0,
+    )
+    key_t_gumbel = key_prime.unsqueeze(3) * gumbel_weights.unsqueeze(-1)  # [N, B, H, K, M]
     key_sum = key_t_gumbel.sum(dim=0)  # [B, H, K, M]
 
     query_source = query_prime[source]  # [B, H, M]
@@ -121,9 +129,11 @@ def _global_gumbel_distribution(model, z, tau, source, seed):
     projection_matrix = _projection_matrix(model.nb_random_features, query.shape[-1], torch.sum(query), device)
     query_prime = model.kernel_transformation(query, True, projection_matrix)[0, :, 0]
     key_prime = model.kernel_transformation(key, False, projection_matrix)[0, :, 0]
-    gumbel = _sample_gumbel((key_prime.shape[0],), seed, device) / tau
+    gumbel_weights = _sample_gumbel_weights(
+        (key_prime.shape[0],), seed, device, tau, normalize_dim=0
+    )
 
-    key_t_gumbel = key_prime * gumbel.exp().unsqueeze(-1)
+    key_t_gumbel = key_prime * gumbel_weights.unsqueeze(-1)
     key_sum = key_t_gumbel.sum(dim=0)
 
     source_to_candidate_num = (query_prime[source].unsqueeze(0) * key_t_gumbel).sum(dim=-1)

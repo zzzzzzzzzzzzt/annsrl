@@ -61,7 +61,7 @@ def edge_mass(edge_weight, edge_src, mask, num_nodes):
 def save_metric_plot(history, run, args):
     if not history:
         return
-    out_dir = os.path.join('results', 'pretrain_metrics')
+    out_dir = os.path.join('results', 'pretrain_metrics_Sigmoid')
     os.makedirs(out_dir, exist_ok=True)
 
     epochs = [item['epoch'] for item in history]
@@ -118,7 +118,8 @@ model=NodeFormer(d, args.hidden_channels, d, num_layers=args.num_layers, dropout
             num_heads=args.num_heads, use_bn=args.use_bn, nb_random_features=args.M,
             use_gumbel=args.use_gumbel, use_residual=args.use_residual, use_act=args.use_act, use_jk=args.use_jk,
             nb_gumbel_sample=args.K, rb_order=args.rb_order, rb_trans=args.rb_trans,
-            sample_hop=args.sample_hop, mass_alpha=args.mass_alpha).to(device)
+            sample_hop=args.sample_hop, mass_alpha=args.mass_alpha,
+            no_topology_bias=args.no_topology_bias).to(device)
 
 logger = Logger(args.runs, args)
 

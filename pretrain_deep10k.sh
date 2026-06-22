@@ -4,7 +4,7 @@ python3 pretrain.py --dataset DEEP10K --graph_type nsw \
 --rand_split --method nodeformer --lr 0.005 \
 --weight_decay 0.05 --dropout 0.3 --num_layers 2 \
 --hidden_channels 256 --num_heads 3 --rb_order 0 \
---rb_trans sigmoid --lamda 0 --M 30 --K 20 --use_bn \
+--rb_trans sigmoid --lamda 0 --M 30 --K 10 --use_bn \
 --use_residual --use_gumbel --runs 5 --epochs 300 --device 0 \
---sample_hop 2 --tau 0.25 --tau_min 0.25 \
+--sample_hop 5 --tau 0.25 --tau_min 0.25 \
 --mass_alpha 0

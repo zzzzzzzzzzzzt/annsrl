@@ -343,7 +343,7 @@ class NodeFormer(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, num_heads=4, dropout=0.0,
                  kernel_transformation=softmax_kernel_transformation, nb_random_features=30, use_bn=True, use_gumbel=True,
                  use_residual=True, use_act=False, use_jk=False, nb_gumbel_sample=10, rb_order=0, rb_trans='sigmoid',
-                 use_edge_loss=True, sample_hop=2, mass_alpha=0.0):
+                 use_edge_loss=True, sample_hop=2, mass_alpha=0.0, no_topology_bias=False, topology_factor = 1):
         super(NodeFormer, self).__init__()
 
         self.input_proj = nn.Linear(in_channels, hidden_channels)
@@ -364,6 +364,7 @@ class NodeFormer(nn.Module):
         topology_dim = hidden_channels * (num_layers + 1) if use_jk else hidden_channels
         self.output_proj = nn.Linear(topology_dim, out_channels)
         self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels), nn.Sigmoid())
+        # self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels))
         self.link_query = nn.Linear(in_channels, hidden_channels, bias=False)
         self.link_key = nn.Linear(in_channels, hidden_channels, bias=False)
 
@@ -381,7 +382,8 @@ class NodeFormer(nn.Module):
             raise ValueError("sample_hop must be at least 2")
         self.sample_hop = sample_hop
         self.mass_alpha = mass_alpha
-
+        self.no_topology_bias = no_topology_bias
+        self.topology_factor = topology_factor
     def reset_parameters(self):
         self.input_proj.reset_parameters()
         self.output_proj.reset_parameters()
@@ -426,7 +428,10 @@ class NodeFormer(nn.Module):
         return topology
 
     def _fuse_features(self, x, topology):
+        if self.no_topology_bias:
+            return x
         gate = self.feature_gate(topology)
+        gate = gate * self.topology_factor
         return x * gate + x
 
     def _link_kernel(self, fused_z, tau):

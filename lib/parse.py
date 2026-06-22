@@ -61,6 +61,8 @@ def parser_add_main_args(parser):
                         help='hop distance used to collect non-neighbor negatives')
     parser.add_argument('--mass_alpha', type=float, default=0.0,
                         help='weight for the positive edge mass bonus in pretraining loss')
+    parser.add_argument('--no_topology_bias', action='store_true',
+                        help='predict edges from raw coordinates without topology-gated feature fusion')
 
     # hyper-parameter for gnn baseline
     parser.add_argument('--hops', type=int, default=1,
