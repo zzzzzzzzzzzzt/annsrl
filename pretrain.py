@@ -13,8 +13,6 @@ from lib.logger import Logger
 from lib.parse import parser_add_main_args
 from lib.graph import pretrain_graph
 from lib.Nodeformer import NodeFormer
-from lib.edge_pi_viz import maybe_plot_edge_attention
-from lib.z_viz import maybe_plot_z_layers
 import time
 
 import warnings
@@ -36,12 +34,6 @@ def adj_mul(adj_i, adj, N):
     return adj_j
 
 
-def current_tau(args, epoch):
-    if args.tau_min is None or args.epochs <= 1:
-        return args.tau
-    progress = epoch / (args.epochs - 1)
-    return args.tau + (args.tau_min - args.tau) * progress
-
 
 def edge_mass(edge_weight, edge_src, mask, num_nodes):
     scores = edge_weight[:, mask].mean(dim=0)
@@ -61,7 +53,7 @@ def edge_mass(edge_weight, edge_src, mask, num_nodes):
 def save_metric_plot(history, run, args):
     if not history:
         return
-    out_dir = os.path.join('results', 'pretrain_metrics_Sigmoid')
+    out_dir = os.path.join('results', 'pretrain_metrics_test02tau0.5hop5')
     os.makedirs(out_dir, exist_ok=True)
 
     epochs = [item['epoch'] for item in history]
@@ -69,7 +61,7 @@ def save_metric_plot(history, run, args):
     ax_mass = ax_loss.twinx()
 
     ax_loss.plot(epochs, [item['loss'] for item in history], label='Loss', color='tab:red')
-    ax_loss.plot(epochs, [item['tau'] for item in history], label='Tau', color='tab:purple', linestyle='--')
+    # ax_loss.plot(epochs, [item['tau'] for item in history], label='Tau', color='tab:purple', linestyle='--')
     ax_mass.plot(epochs, [item['train_mass'] for item in history], label='Train_mass', color='tab:blue')
     ax_mass.plot(epochs, [item['valid_mass'] for item in history], label='Valid_mass', color='tab:green')
     ax_mass.plot(epochs, [item['test_mass'] for item in history], label='Test_mass', color='tab:orange')
@@ -118,8 +110,7 @@ model=NodeFormer(d, args.hidden_channels, d, num_layers=args.num_layers, dropout
             num_heads=args.num_heads, use_bn=args.use_bn, nb_random_features=args.M,
             use_gumbel=args.use_gumbel, use_residual=args.use_residual, use_act=args.use_act, use_jk=args.use_jk,
             nb_gumbel_sample=args.K, rb_order=args.rb_order, rb_trans=args.rb_trans,
-            sample_hop=args.sample_hop, mass_alpha=args.mass_alpha,
-            no_topology_bias=args.no_topology_bias).to(device)
+            sample_hop=args.sample_hop).to(device)
 
 logger = Logger(args.runs, args)
 
@@ -157,8 +148,7 @@ for run in range(args.runs):
         model.train()
         optimizer.zero_grad()
 
-        tau = current_tau(args, epoch)
-        _, link_loss_, _ = model(dataset.vertices[train_idx], dataset.train_edges, tau)
+        _, link_loss_, _ = model(dataset.vertices[train_idx], dataset.train_edges, args.tau)
         loss = link_loss_[-1]
 
         loss.backward()
@@ -168,7 +158,7 @@ for run in range(args.runs):
         if epoch % args.eval_step == 0 and epoch > 0:
             model.eval()
             with torch.no_grad():
-                _, _, weight, z_stages = model(dataset.vertices, dataset.edges, tau, return_z=True)
+                _, _, weight, z_stages = model(dataset.vertices, dataset.edges, args.tau)
                 edge_weight = weight[-1]
                 edge_src = dataset.edges[0]
                 train_edge_mask = torch.isin(edge_src, train_idx)
@@ -179,13 +169,10 @@ for run in range(args.runs):
                 valid_acc = edge_mass(edge_weight, edge_src, valid_edge_mask, n)
                 test_acc = edge_mass(edge_weight, edge_src, test_edge_mask, n)
 
-                maybe_plot_edge_attention(model, dataset.edges, z_stages, tau, run, epoch, args.seed)
-                maybe_plot_z_layers(z_stages, tau, run, epoch, args.seed)
             logger.add_result(run, (train_acc, valid_acc, test_acc, loss.item()))
             metric_history.append({
                 'epoch': epoch,
                 'loss': loss.item(),
-                'tau': tau,
                 'train_mass': train_acc,
                 'valid_mass': valid_acc,
                 'test_mass': test_acc,
@@ -203,7 +190,6 @@ for run in range(args.runs):
             #       f'Test: {100 * test_acc:.4}%')
 
             print(f'Epoch: {epoch:02d}, '
-                f'Tau: {tau:.4f}, '
                 f'Loss: {loss:.6f}, '
                 f'Train_mass: {train_acc:.8f}, '
                 f'Valid_mass: {valid_acc:.8f}, '
