@@ -53,7 +53,8 @@ def edge_mass(edge_weight, edge_src, mask, num_nodes):
 def save_metric_plot(history, run, args):
     if not history:
         return
-    out_dir = os.path.join('results', 'pretrain_metrics_test02tau0.5hop5')
+    out_dir = os.path.join('results', f'pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}'
+                           f'_topology_factor{args.topology_factor}_lossFunction{args.loss_function}/{args.tau}tau')
     os.makedirs(out_dir, exist_ok=True)
 
     epochs = [item['epoch'] for item in history]
@@ -110,7 +111,8 @@ model=NodeFormer(d, args.hidden_channels, d, num_layers=args.num_layers, dropout
             num_heads=args.num_heads, use_bn=args.use_bn, nb_random_features=args.M,
             use_gumbel=args.use_gumbel, use_residual=args.use_residual, use_act=args.use_act, use_jk=args.use_jk,
             nb_gumbel_sample=args.K, rb_order=args.rb_order, rb_trans=args.rb_trans,
-            sample_hop=args.sample_hop).to(device)
+            sample_hop=args.sample_hop, topology_factor=args.topology_factor, 
+            topology_activation=args.topology_activation, loss_function=args.loss_function).to(device)
 
 logger = Logger(args.runs, args)
 
@@ -148,8 +150,7 @@ for run in range(args.runs):
         model.train()
         optimizer.zero_grad()
 
-        _, link_loss_, _ = model(dataset.vertices[train_idx], dataset.train_edges, args.tau)
-        loss = link_loss_[-1]
+        _, loss, _ = model(dataset.vertices[train_idx], dataset.train_edges, args.tau)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -158,8 +159,7 @@ for run in range(args.runs):
         if epoch % args.eval_step == 0 and epoch > 0:
             model.eval()
             with torch.no_grad():
-                _, _, weight, z_stages = model(dataset.vertices, dataset.edges, args.tau)
-                edge_weight = weight[-1]
+                _, _, edge_weight = model(dataset.vertices, dataset.edges, args.tau)
                 edge_src = dataset.edges[0]
                 train_edge_mask = torch.isin(edge_src, train_idx)
                 valid_edge_mask = torch.isin(edge_src, valid_idx)

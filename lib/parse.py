@@ -79,3 +79,9 @@ def parser_add_main_args(parser):
                         help='jumping knowledge type')
     parser.add_argument('--num_mlp_layers', type=int, default=1,
                         help='number of mlp layers in h2gcn')
+    parser.add_argument('--topology_activation', default='Sigmoid', choices=['Sigmoid', 'Tanh', 'None'],
+                    help='activation for topology')
+    parser.add_argument('--topology_factor', type=float, default=0.2,
+                        help='factor for topology')
+    parser.add_argument('--loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator'],
+                    help='loss function for edge loss')
