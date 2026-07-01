@@ -62,6 +62,106 @@ def build_out_neighbors(edge_index, num_nodes, device):
     return neighbor_tensors, degrees
 
 
+def negative_type_counts(neg_ratio, hnsw_m, neg_type_ratios):
+    total = max(0, int(round(neg_ratio * hnsw_m)))
+    ratio_sum = sum(neg_type_ratios)
+    if ratio_sum <= 0:
+        raise ValueError("neg_type_ratios must sum to a positive value")
+    ratios = [r / ratio_sum for r in neg_type_ratios]
+    raw = [total * r for r in ratios]
+    counts = [int(v) for v in raw]
+    for i in sorted(range(3), key=lambda k: raw[k] - counts[k], reverse=True)[:total - sum(counts)]:
+        counts[i] += 1
+    return counts
+
+
+def take_candidates(selected, candidates, target):
+    for v in candidates:
+        if v not in selected:
+            selected.add(v)
+            if len(selected) >= target:
+                break
+
+
+def fill_random_negatives(selected, neighbors_i, node, num_nodes, target):
+    target = min(target, num_nodes - 1 - len(neighbors_i))
+    attempts = 0
+    while len(selected) < target and attempts < 100 + 20 * target:
+        v = int(torch.randint(num_nodes, (1,)).item())
+        if v != node and v not in neighbors_i and v not in selected:
+            selected.add(v)
+        attempts += 1
+    for v in range(num_nodes):
+        if len(selected) >= target:
+            break
+        if v != node and v not in neighbors_i and v not in selected:
+            selected.add(v)
+
+
+def h_hop_candidates(neighbors, node, negative_hop):
+    visited, frontier = {node}, {node}
+    for _ in range(negative_hop):
+        frontier = {v for u in frontier for v in neighbors[u]} - visited
+        if not frontier:
+            break
+        visited.update(frontier)
+    return [v for v in visited if v != node and v not in neighbors[node]]
+
+
+@torch.no_grad()
+def build_negative_edges(x, pos_edges, args):
+    if args.negative_hop < 1:
+        raise ValueError("negative_hop must be at least 1")
+    x = x.detach()
+    num_nodes = x.shape[0]
+    if num_nodes <= 1:
+        return pos_edges.new_empty((2, 0))
+
+    row, col = pos_edges.detach().cpu().tolist()
+    neighbors = [set() for _ in range(num_nodes)]
+    for u, v in zip(row, col):
+        if u != v:
+            neighbors[u].add(v)
+
+    hard_negative_k = args.hard_negative_k or args.hnsw_m
+    hard_k = max(1, hard_negative_k // 2) if args.hard_negative_mode == 'topk_half' else hard_negative_k
+    type_counts = negative_type_counts(args.neg_ratio, args.hnsw_m, args.neg_type_ratios)
+    neg_src, neg_dst = [], []
+
+    for i in range(num_nodes):
+        selected = set()
+        neighbors_i = neighbors[i]
+        if len(neighbors_i) >= num_nodes - 1:
+            continue
+
+        if type_counts[0] > 0 and neighbors_i:
+            neighbor_idx = torch.tensor(list(neighbors_i), device=x.device)
+            max_neighbor_dist = torch.norm(x[neighbor_idx] - x[i], dim=1).max().item()
+            k = min(num_nodes, hard_k + 1)
+            dist, idx = torch.topk(torch.norm(x - x[i], dim=1), k=k, largest=False)
+            hard_candidates = [
+                v for v, d in zip(idx.cpu().tolist(), dist.cpu().tolist())
+                if v != i and v not in neighbors_i and d < max_neighbor_dist
+            ]
+            take_candidates(selected, hard_candidates, type_counts[0])
+
+        if type_counts[1] > 0:
+            take_candidates(
+                selected,
+                h_hop_candidates(neighbors, i, args.negative_hop),
+                len(selected) + type_counts[1],
+            )
+
+        fill_random_negatives(selected, neighbors_i, i, num_nodes, sum(type_counts))
+        selected = sorted(selected)
+        neg_src.extend([i] * len(selected))
+        neg_dst.extend(selected)
+
+    if not neg_src:
+        return pos_edges.new_empty((2, 0))
+    return torch.tensor([neg_src, neg_dst], dtype=torch.long, device=pos_edges.device)
+
+
 @torch.no_grad()
 def eval_edge_weight_and_kernel(model, vertices, edges, tau):
     x = vertices.unsqueeze(0)
@@ -328,7 +428,7 @@ model=NodeFormer(d, args.hidden_channels, d, num_layers=args.num_layers, dropout
             num_heads=args.num_heads, use_bn=args.use_bn, nb_random_features=args.M,
             use_gumbel=args.use_gumbel, use_residual=args.use_residual, use_act=args.use_act, use_jk=args.use_jk,
             nb_gumbel_sample=args.K, rb_order=args.rb_order, rb_trans=args.rb_trans,
-            sample_hop=args.sample_hop, topology_factor=args.topology_factor,
+            topology_factor=args.topology_factor,
             topology_activation=args.topology_activation, loss_function=args.loss_function).to(device)
 
 logger = Logger(args.runs, args)
@@ -355,6 +455,8 @@ train_idx, valid_idx, test_idx = \
     dataset.split_idx_lst['test'].to(device)
 
 out_neighbors, out_degree = build_out_neighbors(dataset.edges, n, device)
+uses_negative_edges = args.loss_function in ['contrastive', 'contrastive_only_numerator', 'sigmoid_loss']
+train_neg_edges = build_negative_edges(dataset.vertices[train_idx], dataset.train_edges, args) if uses_negative_edges else None
 
 ### Training loop ###
 for run in range(args.runs):
@@ -369,7 +471,7 @@ for run in range(args.runs):
         model.train()
         optimizer.zero_grad()
 
-        _, loss, _ = model(dataset.vertices[train_idx], dataset.train_edges, args.tau)
+        _, loss, _ = model(dataset.vertices[train_idx], dataset.train_edges, args.tau, negative_edges=train_neg_edges)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

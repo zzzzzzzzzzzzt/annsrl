@@ -1,10 +1,12 @@
-python3 pretrain.py --dataset DEEP10K --graph_type nsw \
+python3 -u pretrain.py --dataset DEEP10K --graph_type nsw \
 --vertices_path data/DEEP100K/deep10k/deep_base_random10000_seed42.fvecs \
 --edges_path data/DEEP100K/deep10k/deep_hnsw_M12_efC300_random10000_seed42.ivecs \
---rand_split --method nodeformer --lr 0.005 \
+--rand_split --hnsw_m 12 --method nodeformer --lr 0.005 \
 --weight_decay 0.05 --dropout 0.3 --num_layers 2 \
 --hidden_channels 256 --num_heads 3 --rb_order 0 \
 --rb_trans sigmoid --lamda 0 --M 30 --K 10 --use_bn \
 --use_residual --use_gumbel --runs 5 --epochs 300 --device 0 --eval_step 5 \
---sample_hop 5 --tau 0.5 --topology_activation Sigmoid \
---topology_factor 0.2 --loss_function degree_log
+--hard_negative_k 12 --hard_negative_mode topk --negative_hop 2 \
+--neg_ratio 2 --neg_type_ratios 0.4 0.3 0.3 \
+--tau 0.5 --topology_activation Sigmoid \
+--topology_factor 0.2 --loss_function sigmoid_loss

@@ -55,8 +55,18 @@ def parser_add_main_args(parser):
     parser.add_argument('--rb_trans', type=str, default='sigmoid', choices=['sigmoid', 'identity'],
                         help='non-linearity for relational bias')
     parser.add_argument('--batch_size', type=int, default=10000)
-    parser.add_argument('--sample_hop', type=int, default=2,
-                        help='hop distance used to collect non-neighbor negatives')
+    parser.add_argument('--hnsw_m', type=int, default=12,
+                        help='M used by the source NSW/HNSW graph')
+    parser.add_argument('--hard_negative_k', type=int, default=None,
+                        help='top-k nearest candidates for distance hard negatives')
+    parser.add_argument('--hard_negative_mode', type=str, default='topk', choices=['topk', 'topk_half'],
+                        help='candidate range for distance hard negatives')
+    parser.add_argument('--negative_hop', type=int, default=2,
+                        help='hop distance used for topology negatives')
+    parser.add_argument('--neg_ratio', type=float, default=2.0,
+                        help='negative samples per node as neg_ratio * hnsw_m')
+    parser.add_argument('--neg_type_ratios', type=float, nargs=3, default=[0.4, 0.3, 0.3],
+                        help='ratios for hard, h-hop, and random negatives')
     parser.add_argument('--topn_batch_size', type=int, default=256,
                         help='source batch size for top-N neighbor metric')
 
@@ -85,5 +95,5 @@ def parser_add_main_args(parser):
                     help='activation for topology')
     parser.add_argument('--topology_factor', type=float, default=0.2,
                         help='factor for topology')
-    parser.add_argument('--loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator'],
+    parser.add_argument('--loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator', 'sigmoid_loss'],
                     help='loss function for edge loss')

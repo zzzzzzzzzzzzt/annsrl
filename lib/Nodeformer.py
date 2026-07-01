@@ -343,7 +343,7 @@ class NodeFormer(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, num_heads=4, dropout=0.0,
                  kernel_transformation=softmax_kernel_transformation, nb_random_features=30, use_bn=True, use_gumbel=True,
                  use_residual=True, use_act=False, use_jk=False, nb_gumbel_sample=10, rb_order=0, rb_trans='sigmoid',
-                 use_edge_loss=True, sample_hop=2, topology_factor=0.2, topology_activation='Sigmoid', loss_function='degree_log'):
+                 use_edge_loss=True, topology_factor=0.2, topology_activation='Sigmoid', loss_function='degree_log'):
         super(NodeFormer, self).__init__()
 
         self.input_proj = nn.Linear(in_channels, hidden_channels)
@@ -382,9 +382,6 @@ class NodeFormer(nn.Module):
         self.kernel_transformation = kernel_transformation
         self.nb_random_features = nb_random_features
         self.use_gumbel = use_gumbel
-        if sample_hop < 2:
-            raise ValueError("sample_hop must be at least 2")
-        self.sample_hop = sample_hop
         self.topology_factor = topology_factor
         self.loss_function = loss_function
 
@@ -448,75 +445,26 @@ class NodeFormer(nn.Module):
             key_prime = key_prime * gumbel_weights.unsqueeze(-1)
         return query_prime, key_prime
 
-    def _edge_prob(self, query_prime, key_prime, edge_index):
+    def _raw_link_features(self, fused_z):
+        return self.link_query(fused_z).unsqueeze(2), self.link_key(fused_z).unsqueeze(2)
+
+    def _edge_prob(self, query_prime, key_prime, edge_index, only_numerator=False):
         row, col = edge_index
-        key_sum = key_prime.sum(dim=1)
         numerator = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
+        if only_numerator:
+            return numerator
+        key_sum = key_prime.sum(dim=1)
         denominator = (query_prime[:, row] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
         return numerator / denominator.clamp_min(1e-30)
 
-    def _edge_prob_only_numerator(self, query_prime, key_prime, edge_index):
-        row, col = edge_index
-        numerator = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
-        return numerator
-
-    def _h_hop_negative_edges(self, edge_index, num_nodes):
-        row, col = edge_index
-        value = torch.ones(row.numel(), device=edge_index.device)
-        adj = torch.sparse_coo_tensor(edge_index, value, (num_nodes, num_nodes)).coalesce()
-        hop_adj = adj
-        for _ in range(self.sample_hop - 1):
-            hop_adj = torch.sparse.mm(hop_adj, adj).coalesce()
-        hop_edges = hop_adj.indices()
-
-        neg_row, neg_col = hop_edges
-        neg_id = neg_row * num_nodes + neg_col
-        pos_id = (row * num_nodes + col).unique()
-        mask = (neg_row != neg_col) & ~torch.isin(neg_id, pos_id)
-        return hop_edges[:, mask]
-
-    def _contrastive_loss(self, query_prime, key_prime, pos_edges):
+    def _contrastive_loss(self, query_prime, key_prime, pos_edges, neg_edges, only_numerator=False):
         num_nodes = query_prime.shape[1]
-        neg_edges = self._h_hop_negative_edges(pos_edges, num_nodes)
-        pos_prob = self._edge_prob(query_prime, key_prime, pos_edges).clamp_min(1e-30)
+        pos_prob = self._edge_prob(query_prime, key_prime, pos_edges, only_numerator).clamp_min(1e-30)
         if neg_edges.numel() == 0:
             contrastive_loss = pos_prob.sum() * 0
             return contrastive_loss
 
-        neg_prob = self._edge_prob(query_prime, key_prime, neg_edges).clamp_min(1e-30)
-        neg_src = neg_edges[0]
-        neg_mass = torch.zeros(query_prime.shape[0], num_nodes, device=query_prime.device, dtype=neg_prob.dtype)
-        neg_mass.scatter_add_(1, neg_src.unsqueeze(0).expand(query_prime.shape[0], -1), neg_prob)
-
-        pos_src = pos_edges[0]
-        pos_neg_mass = neg_mass[:, pos_src]
-        valid = pos_neg_mass > 0
-        if not valid.any():
-            return pos_prob.sum() * 0
-
-        edge_loss = -(pos_prob.log() - (pos_prob + pos_neg_mass).clamp_min(1e-30).log())
-        edge_loss = torch.where(valid, edge_loss, torch.zeros_like(edge_loss))
-
-        center_loss = torch.zeros(query_prime.shape[0], num_nodes, device=query_prime.device, dtype=edge_loss.dtype)
-        center_count = torch.zeros_like(center_loss)
-        src_index = pos_src.unsqueeze(0).expand(query_prime.shape[0], -1)
-        center_loss.scatter_add_(1, src_index, edge_loss)
-        center_count.scatter_add_(1, src_index, valid.to(edge_loss.dtype))
-
-        center_valid = center_count > 0
-        center_loss = center_loss / center_count.clamp_min(1)
-        contrastive_loss = center_loss[center_valid].mean()
-        return contrastive_loss
-
-    def _contrastive_loss_only_numerator(self, query_prime, key_prime, pos_edges):
-        num_nodes = query_prime.shape[1]
-        neg_edges = self._h_hop_negative_edges(pos_edges, num_nodes)
-        pos_prob = self._edge_prob_only_numerator(query_prime, key_prime, pos_edges).clamp_min(1e-30)
-        if neg_edges.numel() == 0:
-            contrastive_loss = pos_prob.sum() * 0
-            return contrastive_loss
-
-        neg_prob = self._edge_prob_only_numerator(query_prime, key_prime, neg_edges).clamp_min(1e-30)
+        neg_prob = self._edge_prob(query_prime, key_prime, neg_edges, only_numerator).clamp_min(1e-30)
         neg_src = neg_edges[0]
         neg_mass = torch.zeros(query_prime.shape[0], num_nodes, device=query_prime.device, dtype=neg_prob.dtype)
         neg_mass.scatter_add_(1, neg_src.unsqueeze(0).expand(query_prime.shape[0], -1), neg_prob)
@@ -552,7 +500,15 @@ class NodeFormer(nn.Module):
         loss = -(pos_prob.log() * edge_norm.unsqueeze(0)).sum()
         return loss / (pos_prob.shape[0] * num_nodes)
 
-    def forward(self, x, adjs, tau=1.0):
+    def _sigmoid_loss(self, query_prime, key_prime, pos_edges, neg_edges):
+        pos_score = self._edge_prob(query_prime, key_prime, pos_edges, only_numerator=True)
+        pos_loss = F.softplus(-pos_score).mean()
+        if neg_edges.numel() == 0:
+            return pos_loss
+        neg_score = self._edge_prob(query_prime, key_prime, neg_edges, only_numerator=True)
+        return pos_loss + F.softplus(neg_score).mean()
+
+    def forward(self, x, adjs, tau=1.0, negative_edges=None):
         x = x.unsqueeze(0)
         adjs = adjs.unsqueeze(0) if adjs is not None else None
 
@@ -566,15 +522,28 @@ class NodeFormer(nn.Module):
 
         fused_z = self._fuse_features(x, topology)
 
-        query_prime, key_prime = self._link_kernel(fused_z, tau)
-        edge_weight = self._edge_prob(query_prime, key_prime, adjs[0]).clamp_min(1e-30)
+        raw_score_loss = self.training and self.loss_function in ['contrastive_only_numerator', 'sigmoid_loss']
+        if raw_score_loss:
+            query_prime, key_prime = self._raw_link_features(fused_z)
+            edge_weight = None
+        else:
+            query_prime, key_prime = self._link_kernel(fused_z, tau)
+            edge_weight = self._edge_prob(query_prime, key_prime, adjs[0]).clamp_min(1e-30)
         if self.training:
             if(self.loss_function == 'degree_log'):
                 loss = self._degree_log_prob_loss(query_prime, key_prime, adjs[0])
             elif(self.loss_function == 'contrastive'):
-                loss = self._contrastive_loss(query_prime, key_prime, adjs[0])
+                if negative_edges is None:
+                    raise ValueError("negative_edges is required for contrastive loss")
+                loss = self._contrastive_loss(query_prime, key_prime, adjs[0], negative_edges, only_numerator=False)
             elif(self.loss_function == 'contrastive_only_numerator'):
-                loss = self._contrastive_loss_only_numerator(query_prime, key_prime, adjs[0])
+                if negative_edges is None:
+                    raise ValueError("negative_edges is required for contrastive_only_numerator loss")
+                loss = self._contrastive_loss(query_prime, key_prime, adjs[0], negative_edges, only_numerator=True)
+            elif(self.loss_function == 'sigmoid_loss'):
+                if negative_edges is None:
+                    raise ValueError("negative_edges is required for sigmoid_loss")
+                loss = self._sigmoid_loss(query_prime, key_prime, adjs[0], negative_edges)
         else:
             loss = edge_weight.sum() * 0
 

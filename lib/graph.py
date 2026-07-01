@@ -124,7 +124,7 @@ class pretrain_graph:
         self.train_edges, self.node_map = subgraph(self.split_idx_lst['train'], 
                                                     self.edges, relabel_nodes=True)
 
-    def get_idx_split(self, split_type='random', train_prop=.5, valid_prop=.25):
+    def get_idx_split(self, split_type='random', train_prop=.8, valid_prop=.2):
         """
         split_type: 'random' for random splitting, 'class' for splitting with equal node num per class
         train_prop: The proportion of dataset for train split. Between 0 and 1.
@@ -140,7 +140,7 @@ class pretrain_graph:
             perm = torch.as_tensor(np.random.permutation(n))
 
             train_indices = perm[:train_num]
-            val_indices = perm[train_num:train_num + valid_num]
-            test_indices = perm[train_num + valid_num:]
+            val_indices = perm[train_num:]
+            test_indices = perm[train_num:]
 
         return {'train':train_indices, 'valid':val_indices, 'test':test_indices}

@@ -28,7 +28,7 @@ for activation in "${ACTIVATIONS[@]}"; do
       --rb_trans sigmoid --lamda 0 --M 30 --K 10 --use_bn \
       --use_residual --use_gumbel --runs "${RUNS}" --epochs "${EPOCHS}" \
       --device "${DEVICE}" --eval_step "${EVAL_STEP}" \
-      --sample_hop 5 --tau 0.5 --topology_activation "${activation}" \
+      --negative_hop 2 --tau 0.5 --topology_activation "${activation}" \
       --topology_factor "${factor}" --loss_function degree_log \
       --topn_batch_size "${TOPN_BATCH_SIZE}" 2>&1 | tee "${log_path}"
   done
