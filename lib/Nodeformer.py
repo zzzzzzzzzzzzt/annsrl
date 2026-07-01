@@ -343,7 +343,7 @@ class NodeFormer(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, num_heads=4, dropout=0.0,
                  kernel_transformation=softmax_kernel_transformation, nb_random_features=30, use_bn=True, use_gumbel=True,
                  use_residual=True, use_act=False, use_jk=False, nb_gumbel_sample=10, rb_order=0, rb_trans='sigmoid',
-                 use_edge_loss=True, sample_hop=2, mass_alpha=0.0, no_topology_bias=False, topology_factor = 1):
+                 use_edge_loss=True, sample_hop=2, topology_factor=0.2, topology_activation='Sigmoid', loss_function='degree_log'):
         super(NodeFormer, self).__init__()
 
         self.input_proj = nn.Linear(in_channels, hidden_channels)
@@ -363,8 +363,12 @@ class NodeFormer(nn.Module):
 
         topology_dim = hidden_channels * (num_layers + 1) if use_jk else hidden_channels
         self.output_proj = nn.Linear(topology_dim, out_channels)
-        self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels), nn.Sigmoid())
-        # self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels))
+        if topology_activation == 'Sigmoid':
+            self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels), nn.Sigmoid())
+        elif topology_activation == 'Tanh':
+            self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels), nn.Tanh())
+        else:
+            self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels))
         self.link_query = nn.Linear(in_channels, hidden_channels, bias=False)
         self.link_key = nn.Linear(in_channels, hidden_channels, bias=False)
 
@@ -381,9 +385,9 @@ class NodeFormer(nn.Module):
         if sample_hop < 2:
             raise ValueError("sample_hop must be at least 2")
         self.sample_hop = sample_hop
-        self.mass_alpha = mass_alpha
-        self.no_topology_bias = no_topology_bias
         self.topology_factor = topology_factor
+        self.loss_function = loss_function
+
     def reset_parameters(self):
         self.input_proj.reset_parameters()
         self.output_proj.reset_parameters()
@@ -397,7 +401,7 @@ class NodeFormer(nn.Module):
         self.link_query.reset_parameters()
         self.link_key.reset_parameters()
 
-    def _encode_topology(self, x, adjs, tau, z_stages=None):
+    def _encode_topology(self, x, adjs, tau):
         topology = self.input_proj(x)
         if self.use_bn:
             topology = self.bns[0](topology)
@@ -405,8 +409,6 @@ class NodeFormer(nn.Module):
         topology = F.dropout(topology, p=self.dropout, training=self.training)
 
         layers = [topology]
-        if z_stages is not None:
-            z_stages["input_z"] = topology
 
         for i, conv in enumerate(self.convs):
             next_topology = conv(topology, adjs, tau)
@@ -420,19 +422,14 @@ class NodeFormer(nn.Module):
 
             topology = next_topology
             layers.append(topology)
-            if z_stages is not None:
-                z_stages[f"after_layer{i}"] = topology
 
         if self.use_jk:
             topology = torch.cat(layers, dim=-1)
         return topology
 
     def _fuse_features(self, x, topology):
-        if self.no_topology_bias:
-            return x
         gate = self.feature_gate(topology)
-        gate = gate * self.topology_factor
-        return x * gate + x
+        return x * gate * self.topology_factor + x
 
     def _link_kernel(self, fused_z, tau):
         query = self.link_query(fused_z).unsqueeze(2) / math.sqrt(tau)
@@ -458,6 +455,11 @@ class NodeFormer(nn.Module):
         denominator = (query_prime[:, row] * key_sum.unsqueeze(1)).sum(dim=-1).squeeze(-1)
         return numerator / denominator.clamp_min(1e-30)
 
+    def _edge_prob_only_numerator(self, query_prime, key_prime, edge_index):
+        row, col = edge_index
+        numerator = (query_prime[:, row] * key_prime[:, col]).sum(dim=-1).squeeze(-1)
+        return numerator
+
     def _h_hop_negative_edges(self, edge_index, num_nodes):
         row, col = edge_index
         value = torch.ones(row.numel(), device=edge_index.device)
@@ -473,24 +475,13 @@ class NodeFormer(nn.Module):
         mask = (neg_row != neg_col) & ~torch.isin(neg_id, pos_id)
         return hop_edges[:, mask]
 
-    def _positive_mass(self, pos_prob, pos_edges, num_nodes):
-        pos_src = pos_edges[0]
-        pos_mass = torch.zeros(pos_prob.shape[0], num_nodes, device=pos_prob.device, dtype=pos_prob.dtype)
-        pos_mass.scatter_add_(1, pos_src.unsqueeze(0).expand(pos_prob.shape[0], -1), pos_prob)
-        active = pos_mass > 0
-        if not active.any():
-            return pos_prob.sum() * 0
-        return pos_mass[active].mean()
-
     def _contrastive_loss(self, query_prime, key_prime, pos_edges):
         num_nodes = query_prime.shape[1]
         neg_edges = self._h_hop_negative_edges(pos_edges, num_nodes)
         pos_prob = self._edge_prob(query_prime, key_prime, pos_edges).clamp_min(1e-30)
-        pos_mass = self._positive_mass(pos_prob, pos_edges, num_nodes)
-
         if neg_edges.numel() == 0:
             contrastive_loss = pos_prob.sum() * 0
-            return contrastive_loss - self.mass_alpha * pos_mass.clamp_min(1e-30).log()
+            return contrastive_loss
 
         neg_prob = self._edge_prob(query_prime, key_prime, neg_edges).clamp_min(1e-30)
         neg_src = neg_edges[0]
@@ -515,36 +506,76 @@ class NodeFormer(nn.Module):
         center_valid = center_count > 0
         center_loss = center_loss / center_count.clamp_min(1)
         contrastive_loss = center_loss[center_valid].mean()
-        return contrastive_loss - self.mass_alpha * pos_mass.clamp_min(1e-30).log()
+        return contrastive_loss
 
-    def forward(self, x, adjs, tau=1.0, return_z=False):
+    def _contrastive_loss_only_numerator(self, query_prime, key_prime, pos_edges):
+        num_nodes = query_prime.shape[1]
+        neg_edges = self._h_hop_negative_edges(pos_edges, num_nodes)
+        pos_prob = self._edge_prob_only_numerator(query_prime, key_prime, pos_edges).clamp_min(1e-30)
+        if neg_edges.numel() == 0:
+            contrastive_loss = pos_prob.sum() * 0
+            return contrastive_loss
+
+        neg_prob = self._edge_prob_only_numerator(query_prime, key_prime, neg_edges).clamp_min(1e-30)
+        neg_src = neg_edges[0]
+        neg_mass = torch.zeros(query_prime.shape[0], num_nodes, device=query_prime.device, dtype=neg_prob.dtype)
+        neg_mass.scatter_add_(1, neg_src.unsqueeze(0).expand(query_prime.shape[0], -1), neg_prob)
+
+        pos_src = pos_edges[0]
+        pos_neg_mass = neg_mass[:, pos_src]
+        valid = pos_neg_mass > 0
+        if not valid.any():
+            return pos_prob.sum() * 0
+
+        edge_loss = -(pos_prob.log() - (pos_prob + pos_neg_mass).clamp_min(1e-30).log())
+        edge_loss = torch.where(valid, edge_loss, torch.zeros_like(edge_loss))
+
+        center_loss = torch.zeros(query_prime.shape[0], num_nodes, device=query_prime.device, dtype=edge_loss.dtype)
+        center_count = torch.zeros_like(center_loss)
+        src_index = pos_src.unsqueeze(0).expand(query_prime.shape[0], -1)
+        center_loss.scatter_add_(1, src_index, edge_loss)
+        center_count.scatter_add_(1, src_index, valid.to(edge_loss.dtype))
+
+        center_valid = center_count > 0
+        center_loss = center_loss / center_count.clamp_min(1)
+        contrastive_loss = center_loss[center_valid].mean()
+        return contrastive_loss
+
+    def _degree_log_prob_loss(self, query_prime, key_prime, pos_edges):
+        num_nodes = query_prime.shape[1]
+        pos_prob = self._edge_prob(query_prime, key_prime, pos_edges).clamp_min(1e-30)
+
+        pos_src = pos_edges[0]
+        degree_src = degree(pos_src, num_nodes, dtype=pos_prob.dtype).clamp_min(1)
+        edge_norm = 1.0 / degree_src[pos_src]
+
+        loss = -(pos_prob.log() * edge_norm.unsqueeze(0)).sum()
+        return loss / (pos_prob.shape[0] * num_nodes)
+
+    def forward(self, x, adjs, tau=1.0):
         x = x.unsqueeze(0)
         adjs = adjs.unsqueeze(0) if adjs is not None else None
-        z_stages = {} if return_z else None
 
-        topology = self._encode_topology(x, adjs, tau, z_stages)
+        topology = self._encode_topology(x, adjs, tau)
         x_out = self.output_proj(topology).squeeze(0)
 
         if not self.use_edge_loss:
-            if return_z:
-                return x_out, z_stages
             return x_out
         if adjs is None:
             raise ValueError("edge_index is required when use_edge_loss=True")
 
         fused_z = self._fuse_features(x, topology)
-        if z_stages is not None:
-            z_stages["fused_z"] = fused_z
 
         query_prime, key_prime = self._link_kernel(fused_z, tau)
         edge_weight = self._edge_prob(query_prime, key_prime, adjs[0]).clamp_min(1e-30)
         if self.training:
-            contrastive_loss = self._contrastive_loss(query_prime, key_prime, adjs[0])
+            if(self.loss_function == 'degree_log'):
+                loss = self._degree_log_prob_loss(query_prime, key_prime, adjs[0])
+            elif(self.loss_function == 'contrastive'):
+                loss = self._contrastive_loss(query_prime, key_prime, adjs[0])
+            elif(self.loss_function == 'contrastive_only_numerator'):
+                loss = self._contrastive_loss_only_numerator(query_prime, key_prime, adjs[0])
         else:
-            contrastive_loss = edge_weight.sum() * 0
+            loss = edge_weight.sum() * 0
 
-        losses = [contrastive_loss]
-        weights = [edge_weight]
-        if return_z:
-            return x_out, losses, weights, z_stages
-        return x_out, losses, weights
+        return x_out, loss, edge_weight

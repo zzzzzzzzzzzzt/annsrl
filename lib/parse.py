@@ -50,8 +50,6 @@ def parser_add_main_args(parser):
     parser.add_argument('--use_jk', action='store_true', help='concat the layer-wise results in the final layer')
     parser.add_argument('--K', type=int, default=10, help='num of samples for gumbel softmax sampling')
     parser.add_argument('--tau', type=float, default=0.25, help='initial temperature for gumbel softmax')
-    parser.add_argument('--tau_min', type=float, default=None,
-                        help='final temperature for linear annealing; keep fixed when omitted')
     parser.add_argument('--lamda', type=float, default=0.1, help='weight for edge reg loss')
     parser.add_argument('--rb_order', type=int, default=0, help='order for relational bias, 0 for not use')
     parser.add_argument('--rb_trans', type=str, default='sigmoid', choices=['sigmoid', 'identity'],
@@ -59,10 +57,8 @@ def parser_add_main_args(parser):
     parser.add_argument('--batch_size', type=int, default=10000)
     parser.add_argument('--sample_hop', type=int, default=2,
                         help='hop distance used to collect non-neighbor negatives')
-    parser.add_argument('--mass_alpha', type=float, default=0.0,
-                        help='weight for the positive edge mass bonus in pretraining loss')
-    parser.add_argument('--no_topology_bias', action='store_true',
-                        help='predict edges from raw coordinates without topology-gated feature fusion')
+    parser.add_argument('--topn_batch_size', type=int, default=256,
+                        help='source batch size for top-N neighbor metric')
 
     # hyper-parameter for gnn baseline
     parser.add_argument('--hops', type=int, default=1,
@@ -85,3 +81,9 @@ def parser_add_main_args(parser):
                         help='jumping knowledge type')
     parser.add_argument('--num_mlp_layers', type=int, default=1,
                         help='number of mlp layers in h2gcn')
+    parser.add_argument('--topology_activation', default='Sigmoid', choices=['Sigmoid', 'Tanh', 'None'],
+                    help='activation for topology')
+    parser.add_argument('--topology_factor', type=float, default=0.2,
+                        help='factor for topology')
+    parser.add_argument('--loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator'],
+                    help='loss function for edge loss')

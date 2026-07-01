@@ -5,6 +5,6 @@ python3 pretrain.py --dataset DEEP10K --graph_type nsw \
 --weight_decay 0.05 --dropout 0.3 --num_layers 2 \
 --hidden_channels 256 --num_heads 3 --rb_order 0 \
 --rb_trans sigmoid --lamda 0 --M 30 --K 10 --use_bn \
---use_residual --use_gumbel --runs 5 --epochs 300 --device 0 \
---sample_hop 5 --tau 0.25 --tau_min 0.25 \
---mass_alpha 0
+--use_residual --use_gumbel --runs 5 --epochs 300 --device 0 --eval_step 5 \
+--sample_hop 5 --tau 0.5 --topology_activation Sigmoid \
+--topology_factor 0.2 --loss_function degree_log
