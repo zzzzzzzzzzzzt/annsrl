@@ -124,7 +124,7 @@ class pretrain_graph:
         self.train_edges, self.node_map = subgraph(self.split_idx_lst['train'], 
                                                     self.edges, relabel_nodes=True)
 
-    def get_idx_split(self, split_type='random', train_prop=.8, valid_prop=.2):
+    def get_idx_split(self, split_type='random', train_prop=.5, valid_prop=.25):
         """
         split_type: 'random' for random splitting, 'class' for splitting with equal node num per class
         train_prop: The proportion of dataset for train split. Between 0 and 1.

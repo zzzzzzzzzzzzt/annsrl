@@ -13,6 +13,14 @@ def parser_add_main_args(parser):
                         default=1, help='how often to print')
     parser.add_argument('--debug', action='store_true', help='print intermediate tensor statistics for debugging')
     parser.add_argument('--debug_step', type=int, default=50, help='how often to print debug information')
+    parser.add_argument('--embedding_check', action='store_true',
+                        help='export major embedding tensors and PCA diagnostics')
+    parser.add_argument('--embedding_check_step', type=int, default=50,
+                        help='epoch interval for embedding diagnostics')
+    parser.add_argument('--embedding_check_dir', type=str, default='results/embedding_check',
+                        help='directory for embedding diagnostics')
+    parser.add_argument('--embedding_check_max_points', type=int, default=2000,
+                        help='max sampled nodes used for PCA and pairwise cosine diagnostics')
     parser.add_argument('--cpu', action='store_true')
     parser.add_argument('--runs', type=int, default=1,
                         help='number of distinct runs')

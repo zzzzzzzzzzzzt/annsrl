@@ -13,6 +13,7 @@ from lib.logger import Logger
 from lib.parse import parser_add_main_args
 from lib.graph import pretrain_graph
 from lib.Nodeformer import NodeFormer
+from lib.embedding_check import run_embedding_check
 import time
 
 import warnings
@@ -169,7 +170,7 @@ def eval_edge_weight_and_kernel(model, vertices, edges, tau):
     topology = model._encode_topology(x, adjs, tau)
     fused_z = model._fuse_features(x, topology)
     query_prime, key_prime = model._link_kernel(fused_z, tau)
-    edge_weight = model._edge_prob(query_prime, key_prime, edges).clamp_min(1e-30)
+    edge_weight = model._edge_prob(query_prime, key_prime, edges)
     return edge_weight, query_prime[0, :, 0], key_prime[0, :, 0]
 
 
@@ -340,8 +341,8 @@ def save_representative_prob_plot(query_prime, key_prime, edge_index, test_idx, 
 def save_metric_plot(history, run, args):
     if not history:
         return
-    out_dir = os.path.join('results/Topology_factor&Activation_Experiment_pretrain_metrics', f'pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}'
-                           f'_topology_factor{args.topology_factor}_lossFunction{args.loss_function}/{args.tau}tau')
+    out_dir = os.path.join('results/Topology_factor&Activation_Experiment', f'pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}'
+                           f'_topology_factor{args.topology_factor}_lossFunction{args.loss_function}_{args.tau}tau_{args.neg_ratio}neg_ratio')
     os.makedirs(out_dir, exist_ok=True)
 
     epochs = [item['epoch'] for item in history]
@@ -389,7 +390,7 @@ def save_metric_history(history, run, args):
     if not history:
         return
     out_dir = os.path.join("results/Topology_factor&Activation_Experiment", f"pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}"
-                           f"_topology_factor{args.topology_factor}_lossFunction{args.loss_function}/{args.tau}tau")
+                           f"_topology_factor{args.topology_factor}_lossFunction{args.loss_function}_{args.tau}tau_{args.neg_ratio}neg_ratio")
     os.makedirs(out_dir, exist_ok=True)
 
     path = os.path.join(out_dir, f"{args.dataset}_{args.method}_run{run:02d}_metrics.csv")
@@ -466,6 +467,9 @@ for run in range(args.runs):
     optimizer = torch.optim.Adam(model.parameters(),weight_decay=args.weight_decay, lr=args.lr)
     best_val = float('-inf')
     metric_history = []
+    embedding_pca_refs = {}
+    if args.embedding_check:
+        run_embedding_check(model, dataset.vertices, dataset.edges, args, run, 0, None, embedding_pca_refs)
 
     for epoch in range(args.epochs):
         model.train()
@@ -476,6 +480,9 @@ for run in range(args.runs):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+
+        if args.embedding_check and args.embedding_check_step > 0 and epoch > 0 and epoch % args.embedding_check_step == 0:
+            run_embedding_check(model, dataset.vertices, dataset.edges, args, run, epoch, loss.item(), embedding_pca_refs)
 
         if epoch % args.eval_step == 0 and epoch > 0:
             model.eval()
@@ -527,12 +534,12 @@ for run in range(args.runs):
                 f'Test_topN: {test_topn:.6f}'
                 )
 
-    save_metric_plot(metric_history, run, args)
-    save_metric_history(metric_history, run, args)
+    # save_metric_plot(metric_history, run, args)
+    # save_metric_history(metric_history, run, args)
     model.eval()
     with torch.no_grad():
         _, query_prime, key_prime = eval_edge_weight_and_kernel(model, dataset.vertices, dataset.edges, args.tau)
-    save_representative_prob_plot(query_prime, key_prime, dataset.edges, test_idx, out_neighbors, out_degree, run, args)
+    # save_representative_prob_plot(query_prime, key_prime, dataset.edges, test_idx, out_neighbors, out_degree, run, args)
     logger.print_statistics(run)
 
 results = logger.print_statistics()
