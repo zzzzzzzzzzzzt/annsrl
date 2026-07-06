@@ -273,7 +273,8 @@ def save_representative_prob_plot(query_prime, key_prime, edge_index, test_idx, 
     is_neighbor[out_neighbors[node_id]] = True
     display_is_neighbor = is_neighbor[display_nodes].detach().cpu().numpy()
 
-    out_dir = os.path.join('results/Edge_Weight_viz', f'pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}'
+    out_dir = os.path.join('results/Edge_Weight_viz', args.output_timestamp,
+                           f'pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}'
                            f'_topology_factor{args.topology_factor}_lossFunction{args.loss_function}/{args.tau}tau')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -341,7 +342,8 @@ def save_representative_prob_plot(query_prime, key_prime, edge_index, test_idx, 
 def save_metric_plot(history, run, args):
     if not history:
         return
-    out_dir = os.path.join('results/Topology_factor&Activation_Experiment', f'pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}'
+    out_dir = os.path.join('results/Topology_factor&Activation_Experiment', args.output_timestamp,
+                           f'pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}'
                            f'_topology_factor{args.topology_factor}_lossFunction{args.loss_function}_{args.tau}tau_{args.neg_ratio}neg_ratio')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -389,7 +391,8 @@ def save_metric_plot(history, run, args):
 def save_metric_history(history, run, args):
     if not history:
         return
-    out_dir = os.path.join("results/Topology_factor&Activation_Experiment", f"pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}"
+    out_dir = os.path.join("results/Topology_factor&Activation_Experiment", args.output_timestamp,
+                           f"pretrain_metrics_oldlossfuction_topologyActivation{args.topology_activation}"
                            f"_topology_factor{args.topology_factor}_lossFunction{args.loss_function}_{args.tau}tau_{args.neg_ratio}neg_ratio")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -404,6 +407,8 @@ def save_metric_history(history, run, args):
 parser = argparse.ArgumentParser(description='General Training Pipeline')
 parser_add_main_args(parser)
 args = parser.parse_args()
+args.output_timestamp = time.strftime('%m%d_%H%M%S')
+args.embedding_check_dir = os.path.join(args.embedding_check_dir, args.output_timestamp)
 print(args)
 
 fix_seed(args.seed)
@@ -415,7 +420,8 @@ else:
 
 ### Load and preprocess data ###
 dataset = pretrain_graph(args.vertices_path, args.edges_path, graph_type=args.graph_type,
-                         train_prop=args.train_prop, valid_prop=args.valid_prop)
+                         train_prop=args.train_prop, valid_prop=args.valid_prop,
+                         undirected=args.undirected)
 
 ### Basic information of datasets ###
 n = dataset.vertices_size
@@ -430,7 +436,8 @@ model=NodeFormer(d, args.hidden_channels, d, num_layers=args.num_layers, dropout
             use_gumbel=args.use_gumbel, use_residual=args.use_residual, use_act=args.use_act, use_jk=args.use_jk,
             nb_gumbel_sample=args.K, rb_order=args.rb_order, rb_trans=args.rb_trans,
             topology_factor=args.topology_factor,
-            topology_activation=args.topology_activation, loss_function=args.loss_function).to(device)
+            topology_activation=args.topology_activation, loss_function=args.loss_function,
+            link_channels=args.link_channels).to(device)
 
 logger = Logger(args.runs, args)
 
@@ -534,12 +541,12 @@ for run in range(args.runs):
                 f'Test_topN: {test_topn:.6f}'
                 )
 
-    # save_metric_plot(metric_history, run, args)
-    # save_metric_history(metric_history, run, args)
+    save_metric_plot(metric_history, run, args)
+    save_metric_history(metric_history, run, args)
     model.eval()
     with torch.no_grad():
         _, query_prime, key_prime = eval_edge_weight_and_kernel(model, dataset.vertices, dataset.edges, args.tau)
-    # save_representative_prob_plot(query_prime, key_prime, dataset.edges, test_idx, out_neighbors, out_degree, run, args)
+    save_representative_prob_plot(query_prime, key_prime, dataset.edges, test_idx, out_neighbors, out_degree, run, args)
     logger.print_statistics(run)
 
 results = logger.print_statistics()

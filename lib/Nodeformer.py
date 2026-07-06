@@ -343,7 +343,7 @@ class NodeFormer(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, num_heads=4, dropout=0.0,
                  kernel_transformation=softmax_kernel_transformation, nb_random_features=30, use_bn=True, use_gumbel=True,
                  use_residual=True, use_act=False, use_jk=False, nb_gumbel_sample=10, rb_order=0, rb_trans='sigmoid',
-                 use_edge_loss=True, topology_factor=0.2, topology_activation='Sigmoid', loss_function='degree_log', link_channels=32):
+                 use_edge_loss=True, topology_factor=0.2, topology_activation='Sigmoid', loss_function='degree_log', link_channels=256):
         super(NodeFormer, self).__init__()
 
         self.input_proj = nn.Linear(in_channels, hidden_channels)
@@ -369,8 +369,8 @@ class NodeFormer(nn.Module):
             self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels), nn.Tanh())
         else:
             self.feature_gate = nn.Sequential(nn.Linear(topology_dim, in_channels))
-        self.link_query = nn.Linear(in_channels, link_channels)
-        self.link_key = nn.Linear(in_channels, link_channels)
+        self.link_query = nn.Linear(in_channels, link_channels, bias=False)
+        self.link_key = nn.Linear(in_channels, link_channels, bias=False)
 
         self.dropout = dropout
         self.activation = F.elu

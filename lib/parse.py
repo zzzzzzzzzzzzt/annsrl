@@ -3,6 +3,8 @@ def parser_add_main_args(parser):
     parser.add_argument('--method', '-m', type=str, default='nodeformer')
     parser.add_argument('--dataset', type=str, default='')
     parser.add_argument('--graph_type', type=str, default='')
+    parser.add_argument('--undirected', action='store_true',
+                        help='symmetrize graph edges before pretraining')
     parser.add_argument('--vertices_path', type=str, default='')
     parser.add_argument('--edges_path', type=str, default='')
     parser.add_argument('--device', type=int, default=0,
@@ -49,6 +51,8 @@ def parser_add_main_args(parser):
 
     # hyper-parameter for nodeformer
     parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--link_channels', type=int, default=256,
+                        help='hidden channels for NodeFormer link query/key projections')
     parser.add_argument('--M', type=int,
                         default=30, help='number of random features')
     parser.add_argument('--use_gumbel', action='store_true', help='use gumbel softmax for message passing')

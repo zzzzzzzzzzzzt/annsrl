@@ -2,7 +2,7 @@ import warnings
 from .utils import knn, read_edges, read_fvecs, read_ivecs, read_nsg
 import torch
 import numpy as np
-from torch_geometric.utils import subgraph
+from torch_geometric.utils import subgraph, to_undirected
 
 class Graph:
     def __init__(self, vertices_path, edges_path,
@@ -85,11 +85,12 @@ class Graph:
 class pretrain_graph:
     def __init__(self, vertices_path, edges_path, graph_type='nsw',
                 train_prop=.5, valid_prop=.25,
-                vertices_size=None, normalization='global'):
+                vertices_size=None, normalization='global', undirected=False):
         """
         :param vertices_path: path to base datapoints
         :param normalization: normalization of base datapoints {'none', 'global', 'instance'}
         :param graph_type: supported graph types: {'nsw', 'nsg'}.
+        :param undirected: symmetrize edges before building the train subgraph.
         """
         self.graph_type = graph_type
         self.vertices = torch.tensor(read_fvecs(vertices_path, vertices_size))
@@ -116,6 +117,9 @@ class pretrain_graph:
                 dst.append(v)
         
         self.edges = torch.tensor([src, dst], dtype=torch.long)
+        if undirected:
+            self.edges = to_undirected(self.edges, num_nodes=self.vertices_size)
+            self.max_degree = int(torch.bincount(self.edges[0], minlength=self.vertices_size).max().item())
 
         # get the splits for all runs
         self.split_idx_lst = self.get_idx_split(train_prop=train_prop, valid_prop=valid_prop)
