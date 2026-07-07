@@ -6,13 +6,14 @@ if [ "$#" -lt 2 ]; then
   exit 2
 fi
 
-mkdir -p logs
+mkdir -p results/logs
 
 name="$1"
 shift
 
 ts=$(date +"%Y%m%d_%H%M%S")
-log="logs/${ts}_${name}.log"
+log="results/logs/${ts}_${name}.log"
+export RUN_TIMESTAMP="$ts"
 
 script_file=""
 for arg in "$@"; do
@@ -26,6 +27,7 @@ done
   echo "time_start: $(date -Is)"
   echo "cwd: $(pwd)"
   echo "git_commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "run_timestamp: $RUN_TIMESTAMP"
   echo "command: $*"
   if [ -n "$script_file" ]; then
     echo "script_file: $script_file"

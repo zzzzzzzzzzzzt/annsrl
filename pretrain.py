@@ -164,19 +164,18 @@ def build_negative_edges(x, pos_edges, args):
 
 
 @torch.no_grad()
-def eval_edge_weight_and_kernel(model, vertices, edges, tau):
+def eval_edge_weight_and_link_state(model, vertices, edges, tau):
     x = vertices.unsqueeze(0)
     adjs = edges.unsqueeze(0)
     topology = model._encode_topology(x, adjs, tau)
     fused_z = model._fuse_features(x, topology)
-    query_prime, key_prime = model._link_kernel(fused_z, tau)
-    edge_weight = model._edge_prob(query_prime, key_prime, edges)
-    return edge_weight, query_prime[0, :, 0], key_prime[0, :, 0]
+    link_state = model._link_state(fused_z, tau)
+    edge_weight = model.normalized_edge_prob(link_state, edges)
+    return edge_weight, link_state
 
 
-def topn_neighbor_ratio(query_prime, key_prime, node_idx, out_neighbors, out_degree, batch_size):
-    device = query_prime.device
-    key_prime_t = key_prime.t()
+def topn_neighbor_ratio(model, link_state, node_idx, out_neighbors, out_degree, batch_size):
+    device = node_idx.device
     node_idx = node_idx.to(device)
     total_ratio = 0.0
     total_nodes = 0
@@ -189,11 +188,11 @@ def topn_neighbor_ratio(query_prime, key_prime, node_idx, out_neighbors, out_deg
 
         src = src[valid]
         degrees = degrees[valid]
-        max_k = min(int(degrees.max().item()), key_prime.shape[0] - 1)
+        max_k = min(int(degrees.max().item()), out_degree.numel() - 1)
         if max_k <= 0:
             continue
 
-        scores = query_prime[src].matmul(key_prime_t)
+        scores = model.score_all_targets(link_state, src)
         scores[torch.arange(src.numel(), device=device), src] = -float('inf')
         top_idx = scores.topk(max_k, dim=1).indices
 
@@ -208,22 +207,19 @@ def topn_neighbor_ratio(query_prime, key_prime, node_idx, out_neighbors, out_deg
     return total_ratio / total_nodes if total_nodes > 0 else 0.0
 
 
-def neighbor_prob_mass(query_prime, key_prime, edge_index, num_nodes):
+def neighbor_prob_mass(model, link_state, edge_index, num_nodes):
     row, col = edge_index
     keep = row != col
     row, col = row[keep], col[keep]
-    key_sum = key_prime.sum(dim=0)
-    numerator = (query_prime[row] * key_prime[col]).sum(dim=-1)
-    denominator = (query_prime[row] * (key_sum - key_prime[row])).sum(dim=-1).clamp_min(1e-30)
-    edge_prob = numerator / denominator
+    edge_prob = model.normalized_edge_prob(link_state, torch.stack([row, col], dim=0))[0]
 
-    mass = torch.zeros(num_nodes, device=query_prime.device, dtype=query_prime.dtype)
+    mass = torch.zeros(num_nodes, device=row.device, dtype=edge_prob.dtype)
     mass.scatter_add_(0, row, edge_prob)
     return mass
 
 
-def choose_representative_node(query_prime, key_prime, edge_index, candidate_idx, out_degree, num_nodes):
-    mass = neighbor_prob_mass(query_prime, key_prime, edge_index, num_nodes)
+def choose_representative_node(model, link_state, edge_index, candidate_idx, out_degree, num_nodes):
+    mass = neighbor_prob_mass(model, link_state, edge_index, num_nodes)
     candidates = candidate_idx[out_degree[candidate_idx] > 0]
     if candidates.numel() == 0:
         candidates = torch.nonzero(out_degree > 0, as_tuple=False).view(-1)
@@ -239,27 +235,28 @@ def choose_representative_node(query_prime, key_prime, edge_index, candidate_idx
     return int(candidates[distance.argmin()].item()), mass
 
 
-def save_representative_prob_plot(query_prime, key_prime, edge_index, test_idx, out_neighbors, out_degree, run, args):
-    num_nodes = query_prime.shape[0]
-    node_id, mass = choose_representative_node(query_prime, key_prime, edge_index, test_idx, out_degree, num_nodes)
+def save_representative_prob_plot(model, link_state, edge_index, test_idx, out_neighbors, out_degree, run, args):
+    num_nodes = out_degree.numel()
+    node_id, mass = choose_representative_node(model, link_state, edge_index, test_idx, out_degree, num_nodes)
     if node_id is None:
         print('[NODE_PROB_PLOT] skipped: no node with non-self outgoing edges')
         return
 
-    scores = query_prime[node_id].matmul(key_prime.t())
-    scores[node_id] = 0
-    probs = scores / scores.sum().clamp_min(1e-30)
+    node_tensor = torch.tensor([node_id], dtype=torch.long, device=edge_index.device)
+    scores = model.score_all_targets(link_state, node_tensor)[0]
+    scores[node_id] = -float('inf') if model.link_predictor == 'mlp' else 0
+    probs = model.probs_from_scores(scores.unsqueeze(0))[0]
 
     degree_i = int(out_degree[node_id].item())
     topk = min(max(50, 3 * degree_i), 200, num_nodes - 1)
-    all_nodes = torch.arange(num_nodes, device=query_prime.device)
+    all_nodes = torch.arange(num_nodes, device=edge_index.device)
     all_nodes = all_nodes[all_nodes != node_id]
     sorted_all_probs, sorted_all_order = probs[all_nodes].sort(descending=True)
     sorted_all_probs = sorted_all_probs.clamp_min(1e-30)
     sorted_all_nodes = all_nodes[sorted_all_order]
     top_nodes = sorted_all_nodes[:topk]
 
-    selected = torch.zeros(num_nodes, device=query_prime.device, dtype=torch.bool)
+    selected = torch.zeros(num_nodes, device=edge_index.device, dtype=torch.bool)
     selected[top_nodes] = True
     selected[out_neighbors[node_id]] = True
     selected[node_id] = False
@@ -269,7 +266,7 @@ def save_representative_prob_plot(query_prime, key_prime, edge_index, test_idx, 
     display_probs, order = display_probs.sort(descending=True)
     display_nodes = display_nodes[order]
 
-    is_neighbor = torch.zeros(num_nodes, device=query_prime.device, dtype=torch.bool)
+    is_neighbor = torch.zeros(num_nodes, device=edge_index.device, dtype=torch.bool)
     is_neighbor[out_neighbors[node_id]] = True
     display_is_neighbor = is_neighbor[display_nodes].detach().cpu().numpy()
 
@@ -407,7 +404,7 @@ def save_metric_history(history, run, args):
 parser = argparse.ArgumentParser(description='General Training Pipeline')
 parser_add_main_args(parser)
 args = parser.parse_args()
-args.output_timestamp = time.strftime('%m%d_%H%M%S')
+args.output_timestamp = os.environ.get('RUN_TIMESTAMP', time.strftime('%m%d_%H%M%S'))
 args.embedding_check_dir = os.path.join(args.embedding_check_dir, args.output_timestamp)
 print(args)
 
@@ -437,7 +434,8 @@ model=NodeFormer(d, args.hidden_channels, d, num_layers=args.num_layers, dropout
             nb_gumbel_sample=args.K, rb_order=args.rb_order, rb_trans=args.rb_trans,
             topology_factor=args.topology_factor,
             topology_activation=args.topology_activation, loss_function=args.loss_function,
-            link_channels=args.link_channels).to(device)
+            link_channels=args.link_channels, link_predictor=args.link_predictor,
+            undirected=args.undirected).to(device)
 
 logger = Logger(args.runs, args)
 
@@ -494,8 +492,7 @@ for run in range(args.runs):
         if epoch % args.eval_step == 0 and epoch > 0:
             model.eval()
             with torch.no_grad():
-                _, _, edge_weight = model(dataset.vertices, dataset.edges, args.tau)
-                edge_weight, query_prime, key_prime = eval_edge_weight_and_kernel(model, dataset.vertices, dataset.edges, args.tau)
+                edge_weight, link_state = eval_edge_weight_and_link_state(model, dataset.vertices, dataset.edges, args.tau)
                 edge_src = dataset.edges[0]
                 train_edge_mask = torch.isin(edge_src, train_idx)
                 valid_edge_mask = torch.isin(edge_src, valid_idx)
@@ -504,9 +501,9 @@ for run in range(args.runs):
                 train_acc = edge_mass(edge_weight, edge_src, train_edge_mask, n)
                 valid_acc = edge_mass(edge_weight, edge_src, valid_edge_mask, n)
                 test_acc = edge_mass(edge_weight, edge_src, test_edge_mask, n)
-                train_topn = topn_neighbor_ratio(query_prime, key_prime, train_idx, out_neighbors, out_degree, args.topn_batch_size)
-                valid_topn = topn_neighbor_ratio(query_prime, key_prime, valid_idx, out_neighbors, out_degree, args.topn_batch_size)
-                test_topn = topn_neighbor_ratio(query_prime, key_prime, test_idx, out_neighbors, out_degree, args.topn_batch_size)
+                train_topn = topn_neighbor_ratio(model, link_state, train_idx, out_neighbors, out_degree, args.topn_batch_size)
+                valid_topn = topn_neighbor_ratio(model, link_state, valid_idx, out_neighbors, out_degree, args.topn_batch_size)
+                test_topn = topn_neighbor_ratio(model, link_state, test_idx, out_neighbors, out_degree, args.topn_batch_size)
 
             logger.add_result(run, (train_acc, valid_acc, test_acc, loss.item()))
             metric_history.append({
@@ -545,8 +542,8 @@ for run in range(args.runs):
     save_metric_history(metric_history, run, args)
     model.eval()
     with torch.no_grad():
-        _, query_prime, key_prime = eval_edge_weight_and_kernel(model, dataset.vertices, dataset.edges, args.tau)
-    save_representative_prob_plot(query_prime, key_prime, dataset.edges, test_idx, out_neighbors, out_degree, run, args)
+        _, link_state = eval_edge_weight_and_link_state(model, dataset.vertices, dataset.edges, args.tau)
+    save_representative_prob_plot(model, link_state, dataset.edges, test_idx, out_neighbors, out_degree, run, args)
     logger.print_statistics(run)
 
 results = logger.print_statistics()
@@ -555,8 +552,7 @@ results = logger.print_statistics()
 @torch.no_grad()
 def evaluate(model, dataset, split_idx, args):
     model.eval()
-    _, _, weight = model(dataset.vertices, dataset.edges, args.tau)
-    edge_weight = weight[-1]
+    edge_weight, _ = eval_edge_weight_and_link_state(model, dataset.vertices, dataset.edges, args.tau)
     edge_src = dataset.edges[0]
     train_edge_mask = torch.isin(edge_src, split_idx["train"].to(edge_src.device))
     valid_edge_mask = torch.isin(edge_src, split_idx["valid"].to(edge_src.device))

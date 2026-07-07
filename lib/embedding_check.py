@@ -218,7 +218,7 @@ def collect_embedding_tensors(model, vertices, edges, tau):
     query = model.link_query(fused_z)
     key = model.link_key(fused_z)
     query_prime, key_prime = model._link_kernel(fused_z, tau)
-    edge_weight = model._edge_prob(query_prime, key_prime, edges)
+    edge_weight = model.normalized_edge_prob(model._link_state(fused_z, tau), edges)
 
     if was_training:
         model.train()

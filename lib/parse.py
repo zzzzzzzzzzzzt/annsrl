@@ -53,6 +53,8 @@ def parser_add_main_args(parser):
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--link_channels', type=int, default=256,
                         help='hidden channels for NodeFormer link query/key projections')
+    parser.add_argument('--link_predictor', type=str, default='kernel', choices=['kernel', 'mlp'],
+                        help='link predictor used for edge scoring')
     parser.add_argument('--M', type=int,
                         default=30, help='number of random features')
     parser.add_argument('--use_gumbel', action='store_true', help='use gumbel softmax for message passing')
