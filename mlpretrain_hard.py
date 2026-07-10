@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 from lib.parse import parser_add_main_args
 from lib.graph import pretrain_graph
@@ -184,19 +185,6 @@ def infonce_edge_loss(model, z, pos_edges, num_nodes, neg_per_pos, temperature=1
     return F.cross_entropy(logits, labels)
 
 
-def batched_edge_loss(loss_fn, model, z, pos_edges, num_nodes, neg_per_pos, batch_size, **kwargs):
-    num_edges = pos_edges.shape[1]
-    if batch_size <= 0 or batch_size >= num_edges:
-        return loss_fn(model, z, pos_edges, num_nodes, neg_per_pos, **kwargs)
-
-    total_loss = z.new_zeros(())
-    for start in range(0, num_edges, batch_size):
-        batch_edges = pos_edges[:, start:start + batch_size]
-        batch_loss = loss_fn(model, z, batch_edges, num_nodes, neg_per_pos, **kwargs)
-        total_loss = total_loss + batch_loss * batch_edges.shape[1]
-    return total_loss / num_edges
-
-
 # --------------------------------------------------------------------------- #
 # Metrics (mirror pretrain.py where meaningful)
 # --------------------------------------------------------------------------- #
@@ -250,36 +238,62 @@ def topn_neighbor_ratio(model, z, node_idx, out_neighbors, out_degree, batch_siz
 
 
 @torch.no_grad()
-def edge_probs(model, z, edge_index, mask, num_nodes, neg_per_pos=1):
+def edge_probs(model, z, edge_index, mask, num_nodes, neg_per_pos=1, batch_size=10000):
     """Mean sigmoid(logit) on the masked true edges vs. random negatives from the
     same sources -- a quick read on how well positives separate from noise."""
     if not mask.any():
         return 0.0, 0.0
     sub = edge_index[:, mask]
-    pos_prob = torch.sigmoid(model.edge_logits(z, sub)).mean().item()
+    pos_sum = 0.0
+    neg_sum = 0.0
+    pos_count = 0
+    neg_count = 0
+    batch_size = max(1, int(batch_size))
 
-    neg_src = sub[0].repeat_interleave(max(1, neg_per_pos))
-    neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
-    neg = torch.stack([neg_src, neg_dst], dim=0)
-    neg_prob = torch.sigmoid(model.edge_logits(z, neg)).mean().item()
-    return pos_prob, neg_prob
+    for start in range(0, sub.shape[1], batch_size):
+        edge_batch = sub[:, start:start + batch_size]
+        pos_prob = torch.sigmoid(model.edge_logits(z, edge_batch))
+        pos_sum += float(pos_prob.sum().item())
+        pos_count += int(pos_prob.numel())
+
+        neg_src = edge_batch[0].repeat_interleave(max(1, neg_per_pos))
+        neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
+        neg = torch.stack([neg_src, neg_dst], dim=0)
+        neg_prob = torch.sigmoid(model.edge_logits(z, neg))
+        neg_sum += float(neg_prob.sum().item())
+        neg_count += int(neg_prob.numel())
+
+    return pos_sum / pos_count, neg_sum / neg_count
 
 
 @torch.no_grad()
-def edge_scores(model, z, edge_index, mask, num_nodes, neg_per_pos=1):
+def edge_scores(model, z, edge_index, mask, num_nodes, neg_per_pos=1, batch_size=10000):
     """Raw-score counterpart of edge_probs (no sigmoid): mean edge_logit on true
     edges vs. random negatives. Use with InfoNCE, which optimizes relative
     ranking rather than calibrated probabilities, so sigmoid would be misleading."""
     if not mask.any():
         return 0.0, 0.0
     sub = edge_index[:, mask]
-    pos_score = model.edge_logits(z, sub).mean().item()
+    pos_sum = 0.0
+    neg_sum = 0.0
+    pos_count = 0
+    neg_count = 0
+    batch_size = max(1, int(batch_size))
 
-    neg_src = sub[0].repeat_interleave(max(1, neg_per_pos))
-    neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
-    neg = torch.stack([neg_src, neg_dst], dim=0)
-    neg_score = model.edge_logits(z, neg).mean().item()
-    return pos_score, neg_score
+    for start in range(0, sub.shape[1], batch_size):
+        edge_batch = sub[:, start:start + batch_size]
+        pos_score = model.edge_logits(z, edge_batch)
+        pos_sum += float(pos_score.sum().item())
+        pos_count += int(pos_score.numel())
+
+        neg_src = edge_batch[0].repeat_interleave(max(1, neg_per_pos))
+        neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
+        neg = torch.stack([neg_src, neg_dst], dim=0)
+        neg_score = model.edge_logits(z, neg)
+        neg_sum += float(neg_score.sum().item())
+        neg_count += int(neg_score.numel())
+
+    return pos_sum / pos_count, neg_sum / neg_count
 
 
 # --------------------------------------------------------------------------- #
@@ -378,6 +392,8 @@ def main():
 
     # number of nodes in the (relabeled) train subgraph used for the loss
     num_train_nodes = int(train_idx.numel())
+    train_edge_ids = torch.arange(dataset.train_edges.shape[1], dtype=torch.long)
+    train_edge_dataset = TensorDataset(train_edge_ids)
     out_neighbors, out_degree = build_out_neighbors(dataset.edges, n, device)
 
     model = MLPLinkNet(d, node_hidden=args.node_hidden, node_layers=args.node_layers,
@@ -398,21 +414,37 @@ def main():
         best_state = None
         best_epoch = -1
         history = []
+        train_edge_loader = DataLoader(
+            train_edge_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=False,
+        )
 
         for epoch in range(args.epochs):
             model.train()
             optimizer.zero_grad()
-            # train on the compacted train subgraph, exactly like pretrain.py:
-            # dataset.train_edges is relabeled into the train-node index space.
-            z = model.encode(dataset.vertices[train_idx])
-            if args.loss == 'infonce':
-                loss = batched_edge_loss(infonce_edge_loss, model, z, dataset.train_edges,
-                                         num_train_nodes, args.neg_per_pos, args.batch_size,
-                                         temperature=args.infonce_temp)
-            else:
-                loss = batched_edge_loss(bce_edge_loss, model, z, dataset.train_edges,
-                                         num_train_nodes, args.neg_per_pos, args.batch_size)
-            loss.backward()
+            # Encode all nodes, then gather train nodes because train_edges is
+            # relabeled into the compact train-node index space.
+            z_full = model.encode(dataset.vertices)
+            z = z_full[train_idx]
+
+            total_edges = dataset.train_edges.shape[1]
+            num_batches = len(train_edge_loader)
+            loss_value = 0.0
+
+            for batch_id, (batch_idx,) in enumerate(train_edge_loader):
+                batch_idx = batch_idx.to(device)
+                edge_batch = dataset.train_edges[:, batch_idx]
+                if args.loss == 'infonce':
+                    batch_loss = infonce_edge_loss(model, z, edge_batch, num_train_nodes,
+                                                   args.neg_per_pos, temperature=args.infonce_temp)
+                else:
+                    batch_loss = bce_edge_loss(model, z, edge_batch, num_train_nodes, args.neg_per_pos)
+
+                # scaled_loss = batch_loss * (edge_batch.shape[1] / total_edges)
+                batch_loss.backward(retain_graph=batch_id < num_batches - 1)
+                loss_value += float(batch_loss.detach())
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -426,13 +458,15 @@ def main():
                 with torch.no_grad():
                     z_full = model.encode(dataset.vertices)
                     monitor = edge_scores if args.loss == 'infonce' else edge_probs
-                    train_pos, train_neg = monitor(model, z_full, dataset.edges, train_mask, n, args.neg_per_pos)
-                    valid_pos, valid_neg = monitor(model, z_full, dataset.edges, valid_mask, n, args.neg_per_pos)
+                    train_pos, train_neg = monitor(model, z_full, dataset.edges, train_mask, n,
+                                                   args.neg_per_pos, args.batch_size)
+                    valid_pos, valid_neg = monitor(model, z_full, dataset.edges, valid_mask, n,
+                                                   args.neg_per_pos, args.batch_size)
 
                 # Model selection on validation positive score (how confidently
                 # the model scores true valid edges), not the pos-neg gap.
                 history.append({
-                    'epoch': epoch, 'loss': loss.item(),
+                    'epoch': epoch, 'loss': loss_value,
                     'train_pos_prob': train_pos, 'train_neg_prob': train_neg,
                     'valid_pos_prob': valid_pos, 'valid_neg_prob': valid_neg,
                 })
@@ -441,7 +475,7 @@ def main():
                     best_epoch = epoch
                     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-                print(f'Epoch: {epoch:03d}, Loss: {loss.item():.6f}, '
+                print(f'Epoch: {epoch:03d}, Loss: {loss_value:.6f}, '
                       f'PosProb(tr/va): {train_pos:.4f}/{valid_pos:.4f}, '
                       f'NegProb(tr/va): {train_neg:.4f}/{valid_neg:.4f}')
 
