@@ -168,18 +168,53 @@ def bce_edge_loss(model, z, pos_edges, num_nodes, neg_per_pos):
 # to the positive and all negatives cancels in the softmax, so dot_bias receives
 # no gradient under this loss.
 # --------------------------------------------------------------------------- #
-def infonce_edge_loss(model, z, pos_edges, num_nodes, neg_per_pos, temperature=1.0):
+def _sample_hard_negatives(src, hard_neg_table, hard_neg_per_pos, num_nodes):
+    """For each source node in `src` [E], draw `hard_neg_per_pos` hard-negative
+    destinations from its precomputed pool (a padded [N, P] table, -1 = empty).
+    Slots that fall on padding (short pool) are backfilled with random nodes so
+    every positive edge gets exactly `hard_neg_per_pos` hard columns.
+    Returns a [E, hard_neg_per_pos] LongTensor of destination node ids."""
+    device = src.device
+    pool = hard_neg_table[src]                                  # [E, P]
+    pool_size = pool.shape[1]
+    # random column indices into the pool, one set per requested hard negative
+    col = torch.randint(0, pool_size, (src.shape[0], hard_neg_per_pos), device=device)
+    dst = torch.gather(pool, 1, col)                            # [E, H], may hold -1
+    # backfill padding (-1) with uniform random nodes
+    pad = dst < 0
+    if pad.any():
+        rand = torch.randint(0, num_nodes, (int(pad.sum().item()),), device=device)
+        dst = dst.clone()
+        dst[pad] = rand
+    return dst
+
+
+def infonce_edge_loss(model, z, pos_edges, num_nodes, neg_per_pos, temperature=1.0,
+                      hard_neg_table=None, hard_neg_per_pos=0):
     pos_logits = model.edge_logits(z, pos_edges)          # [E]
-    if neg_per_pos <= 0 or num_nodes <= 1:
+    total_neg = neg_per_pos + (hard_neg_per_pos if hard_neg_table is not None else 0)
+    if total_neg <= 0 or num_nodes <= 1:
         return pos_logits.sum() * 0.0
 
-    neg_src = pos_edges[0].repeat_interleave(neg_per_pos)
-    neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
-    neg_edges = torch.stack([neg_src, neg_dst], dim=0)
-    neg_logits = model.edge_logits(z, neg_edges)          # [E * K]
+    src = pos_edges[0]                                     # [E]
+    neg_cols = []
 
-    logits = torch.cat([pos_logits.view(-1, 1),
-                        neg_logits.view(-1, neg_per_pos)], dim=1)  # [E, 1 + K]
+    # Random negatives: uniform over all nodes.
+    if neg_per_pos > 0:
+        rand_src = src.repeat_interleave(neg_per_pos)
+        rand_dst = torch.randint(0, num_nodes, (rand_src.numel(),), device=z.device)
+        rand_logits = model.edge_logits(z, torch.stack([rand_src, rand_dst], dim=0))
+        neg_cols.append(rand_logits.view(-1, neg_per_pos))          # [E, R]
+
+    # Hard negatives: near-but-pruned nodes drawn from each source's pool.
+    if hard_neg_table is not None and hard_neg_per_pos > 0:
+        hard_dst = _sample_hard_negatives(src, hard_neg_table, hard_neg_per_pos, num_nodes)
+        hard_src = src.view(-1, 1).expand(-1, hard_neg_per_pos)     # [E, H]
+        hard_logits = model.edge_logits(z, torch.stack([hard_src.reshape(-1),
+                                                        hard_dst.reshape(-1)], dim=0))
+        neg_cols.append(hard_logits.view(-1, hard_neg_per_pos))     # [E, H]
+
+    logits = torch.cat([pos_logits.view(-1, 1)] + neg_cols, dim=1)  # [E, 1 + R + H]
     logits = logits / temperature
     labels = torch.zeros(logits.shape[0], dtype=torch.long, device=z.device)
     return F.cross_entropy(logits, labels)
@@ -206,6 +241,68 @@ def build_out_neighbors(edge_index, num_nodes, device):
     neighbor_tensors = [torch.tensor(sorted(v), dtype=torch.long, device=device) for v in neighbors]
     degrees = torch.tensor([len(v) for v in neighbors], dtype=torch.long, device=device)
     return neighbor_tensors, degrees
+
+
+# --------------------------------------------------------------------------- #
+# Hard negatives: nodes that sit CLOSE to a source (inside the radius of its
+# farthest true neighbor) yet are NOT connected to it. In a pruned proximity
+# graph (NSW/HNSW) these are exactly the near points whose edges the build-time
+# pruning heuristic dropped -- the most confusable non-neighbors, and the ones
+# that force the model to learn the graph's topology rather than raw proximity.
+# This mirrors the hard-negative construction in pretrain.build_negative_edges.
+#
+# Distances are computed on the ORIGINAL coordinates (before per-feature
+# standardization), because the proximity graph was pruned in that raw L2 space
+# and standardization (a per-dim rescale) would reorder nearest neighbors.
+#
+# Precomputed ONCE: it depends only on coordinates and topology, not on model
+# parameters. Returns a padded [N, max_pool] LongTensor (-1 = empty slot).
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def build_hard_negatives(coords, pos_edges, num_nodes, topk, block=1024):
+    device = coords.device
+    neighbors = [set() for _ in range(num_nodes)]
+    row, col = pos_edges.detach().cpu().tolist()
+    for u, v in zip(row, col):
+        if u != v:
+            neighbors[u].add(v)
+
+    k = min(num_nodes, max(1, topk) + 1)   # +1 to absorb self in the topk
+    pools = []
+    max_pool = 0
+    for start in range(0, num_nodes, block):
+        stop = min(start + block, num_nodes)
+        # squared L2 from each source in the block to every node: [B, N]
+        d2 = torch.cdist(coords[start:stop], coords)
+        dist, idx = torch.topk(d2, k=k, largest=False)             # nearest k
+        dist = dist.cpu().tolist()
+        idx = idx.cpu().tolist()
+        for r, i in enumerate(range(start, stop)):
+            nbr = neighbors[i]
+            if not nbr:
+                pools.append([])                # no neighbor radius -> no hard neg
+                continue
+            nbr_idx = torch.tensor(sorted(nbr), device=device)
+            d_max = torch.cdist(coords[i:i + 1], coords[nbr_idx]).max().item()
+            hard = [v for v, dd in zip(idx[r], dist[r])
+                    if v != i and v not in nbr and dd < d_max]
+            pools.append(hard)
+            max_pool = max(max_pool, len(hard))
+
+    if max_pool == 0:
+        table = torch.full((num_nodes, 1), -1, dtype=torch.long, device=device)
+        return table, 0.0, 0.0
+
+    table = torch.full((num_nodes, max_pool), -1, dtype=torch.long, device=device)
+    covered, total = 0, 0
+    for i, hard in enumerate(pools):
+        if hard:
+            table[i, :len(hard)] = torch.tensor(hard, dtype=torch.long, device=device)
+            covered += 1
+            total += len(hard)
+    coverage = covered / num_nodes
+    avg_pool = total / max(1, covered)
+    return table, coverage, avg_pool
 
 
 @torch.no_grad()
@@ -361,6 +458,12 @@ def main():
                              "'infonce'=softmax over 1 pos + K neg per source (raw-score monitoring)")
     parser.add_argument('--infonce_temp', type=float, default=0.1,
                         help='softmax temperature for the InfoNCE loss (only used when --loss infonce)')
+    parser.add_argument('--hard_neg_per_pos', type=int, default=5,
+                        help='hard negatives per positive edge for InfoNCE: near-but-pruned '
+                             'nodes drawn from each source pool (0 disables, pure random negatives)')
+    parser.add_argument('--hard_neg_topk', type=int, default=0,
+                        help='nearest-candidate range for building the hard-negative pool '
+                             '(0 -> fall back to --hnsw_m)')
     args = parser.parse_args()
     args.output_timestamp = os.environ.get('RUN_TIMESTAMP', time.strftime('%Y%m%d_%H%M%S'))
     print(args)
@@ -377,6 +480,10 @@ def main():
     print(f"dataset {args.dataset} | num nodes {n} | num edge {e} | num node feats {d}")
 
     dataset.vertices = dataset.vertices.to(device)
+
+    # Snapshot the ORIGINAL coordinates before standardization: the proximity
+    # graph was pruned in this raw L2 space, so hard negatives must be found here.
+    raw_vertices = dataset.vertices.clone()
 
     # Force feature standardization: skewed raw coordinates can starve the
     # encoder of gradient. Zero-mean/unit-std per feature dimension.
@@ -395,6 +502,17 @@ def main():
     train_edge_ids = torch.arange(dataset.train_edges.shape[1], dtype=torch.long)
     train_edge_dataset = TensorDataset(train_edge_ids)
     out_neighbors, out_degree = build_out_neighbors(dataset.edges, n, device)
+
+    # Precompute the hard-negative pool ONCE (parameter-independent): for each
+    # train source, the near-but-pruned non-neighbors, found on raw coordinates
+    # in the compact train-node index space (same space as dataset.train_edges).
+    hard_neg_table = None
+    if args.loss == 'infonce' and args.hard_neg_per_pos > 0:
+        hard_topk = args.hard_neg_topk if args.hard_neg_topk > 0 else args.hnsw_m
+        hard_neg_table, hard_cov, hard_avg = build_hard_negatives(
+            raw_vertices[train_idx], dataset.train_edges, num_train_nodes, hard_topk)
+        print(f"[HARD_NEG] topk={hard_topk} coverage={hard_cov:.3f} "
+              f"avg_pool={hard_avg:.2f} table={tuple(hard_neg_table.shape)}")
 
     model = MLPLinkNet(d, node_hidden=args.node_hidden, node_layers=args.node_layers,
                        pair_hidden=args.pair_hidden, dropout=args.dropout,
@@ -438,7 +556,9 @@ def main():
                 edge_batch = dataset.train_edges[:, batch_idx]
                 if args.loss == 'infonce':
                     batch_loss = infonce_edge_loss(model, z, edge_batch, num_train_nodes,
-                                                   args.neg_per_pos, temperature=args.infonce_temp)
+                                                   args.neg_per_pos, temperature=args.infonce_temp,
+                                                   hard_neg_table=hard_neg_table,
+                                                   hard_neg_per_pos=args.hard_neg_per_pos)
                 else:
                     batch_loss = bce_edge_loss(model, z, edge_batch, num_train_nodes, args.neg_per_pos)
 
