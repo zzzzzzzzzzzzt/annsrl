@@ -1,0 +1,19 @@
+
+lib/__pycache__/*
+lib/search_hnsw_swig/*
+results/*
+log/*
+data/*
+notebooks/*
+
+.vscode/launch.json
+.vscode/settings.json
+scripts
+
+# training artifacts / checkpoints / build outputs
+__pycache__/
+runs/
+models/
+index/
+figure/
+TBG/

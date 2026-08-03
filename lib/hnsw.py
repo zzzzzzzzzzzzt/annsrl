@@ -246,6 +246,7 @@ class ParallelHNSW(HNSW):
                 best_vertex_ids=best_vertex_ids[i],
                 total_distance_computations=total_distance_computations[i],
                 num_hops=num_hops[i],
+                path=trajectory.tolist(),
             )
             session_records.append(rec)
         return session_records

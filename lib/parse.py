@@ -3,6 +3,8 @@ def parser_add_main_args(parser):
     parser.add_argument('--method', '-m', type=str, default='nodeformer')
     parser.add_argument('--dataset', type=str, default='')
     parser.add_argument('--graph_type', type=str, default='')
+    parser.add_argument('--undirected', action='store_true',
+                        help='symmetrize graph edges before pretraining')
     parser.add_argument('--vertices_path', type=str, default='')
     parser.add_argument('--edges_path', type=str, default='')
     parser.add_argument('--device', type=int, default=0,
@@ -13,12 +15,20 @@ def parser_add_main_args(parser):
                         default=1, help='how often to print')
     parser.add_argument('--debug', action='store_true', help='print intermediate tensor statistics for debugging')
     parser.add_argument('--debug_step', type=int, default=50, help='how often to print debug information')
+    parser.add_argument('--embedding_check', action='store_true',
+                        help='export major embedding tensors and PCA diagnostics')
+    parser.add_argument('--embedding_check_step', type=int, default=50,
+                        help='epoch interval for embedding diagnostics')
+    parser.add_argument('--embedding_check_dir', type=str, default='results/embedding_check',
+                        help='directory for embedding diagnostics')
+    parser.add_argument('--embedding_check_max_points', type=int, default=2000,
+                        help='max sampled nodes used for PCA and pairwise cosine diagnostics')
     parser.add_argument('--cpu', action='store_true')
     parser.add_argument('--runs', type=int, default=1,
                         help='number of distinct runs')
-    parser.add_argument('--train_prop', type=float, default=.5,
+    parser.add_argument('--train_prop', type=float, default=.8,
                         help='training label proportion')
-    parser.add_argument('--valid_prop', type=float, default=.25,
+    parser.add_argument('--valid_prop', type=float, default=.1,
                         help='validation label proportion')
     parser.add_argument('--protocol', type=str, default='semi',
                         help='protocol for cora datasets with fixed splits, semi or supervised')
@@ -29,7 +39,7 @@ def parser_add_main_args(parser):
 
     parser.add_argument('--knn_num', type=int, default=5, help='number of k for KNN graph')
     parser.add_argument('--save_model', action='store_true', help='whether to save model')
-    parser.add_argument('--model_dir', type=str, default='../model/')
+    parser.add_argument('--model_dir', type=str, default='models')
 
     # hyper-parameter for model arch and training
     parser.add_argument('--hidden_channels', type=int, default=32)
@@ -41,6 +51,12 @@ def parser_add_main_args(parser):
 
     # hyper-parameter for nodeformer
     parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--link_channels', type=int, default=256,
+                        help='hidden channels for NodeFormer link query/key projections')
+    parser.add_argument('--link_predictor', type=str, default='kernel', choices=['kernel', 'mlp'],
+                        help='link predictor used for edge scoring')
+    parser.add_argument('--disable_link_projection', action='store_true',
+                        help='disable NodeFormer link query/key linear projections and use fused features directly')
     parser.add_argument('--M', type=int,
                         default=30, help='number of random features')
     parser.add_argument('--use_gumbel', action='store_true', help='use gumbel softmax for message passing')
@@ -55,8 +71,22 @@ def parser_add_main_args(parser):
     parser.add_argument('--rb_trans', type=str, default='sigmoid', choices=['sigmoid', 'identity'],
                         help='non-linearity for relational bias')
     parser.add_argument('--batch_size', type=int, default=10000)
-    parser.add_argument('--sample_hop', type=int, default=2,
-                        help='hop distance used to collect non-neighbor negatives')
+    parser.add_argument('--hnsw_m', type=int, default=12,
+                        help='M used by the source NSW/HNSW graph')
+    parser.add_argument('--hard_negative_k', type=int, default=None,
+                        help='top-k nearest candidates for distance hard negatives')
+    parser.add_argument('--hard_negative_mode', type=str, default='topk', choices=['topk', 'topk_half'],
+                        help='candidate range for distance hard negatives')
+    parser.add_argument('--negative_gt_path', type=str, default='',
+                        help='ivecs file containing precomputed nearest neighbors for hard negative sampling')
+    parser.add_argument('--negative_hop', type=int, default=2,
+                        help='hop distance used for topology negatives')
+    parser.add_argument('--neg_ratio', type=float, default=2.0,
+                        help='negative samples per node as neg_ratio * hnsw_m')
+    parser.add_argument('--neg_type_ratios', type=float, nargs=3, default=[0.4, 0.3, 0.3],
+                        help='ratios for hard, h-hop, and random negatives')
+    parser.add_argument('--topn_batch_size', type=int, default=256,
+                        help='source batch size for top-N neighbor metric')
 
     # hyper-parameter for gnn baseline
     parser.add_argument('--hops', type=int, default=1,
@@ -83,5 +113,5 @@ def parser_add_main_args(parser):
                     help='activation for topology')
     parser.add_argument('--topology_factor', type=float, default=0.2,
                         help='factor for topology')
-    parser.add_argument('--loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator'],
+    parser.add_argument('--Loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator', 'sigmoid_loss'],
                     help='loss function for edge loss')

@@ -1,0 +1,22 @@
+python -u mlpretrain_hard.py \
+    --dataset SIFT100K \
+    --graph_type nsw \
+    --vertices_path data/SIFT100K/sift_base.fvecs \
+    --edges_path data/SIFT100K/sift_hnsw_M12_efC300.ivecs \
+    --rand_split \
+    --lr 0.01 \
+    --weight_decay 0.0 \
+    --dropout 0.3 \
+    --eval_step 1 \
+    --node_hidden 128 \
+    --scorer dot \
+    --loss infonce \
+    --norm none \
+    --neg_per_pos 32 \
+    --batch_size 1024 \
+    --hard_neg_per_pos 10 \
+    --knncache data/SIFT100K/knn_cache \
+    --runs 5 \
+    --epochs 300 \
+    --device 0 \
+    --train_prop 1.0

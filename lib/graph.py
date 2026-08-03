@@ -1,8 +1,49 @@
+import os
 import warnings
 from .utils import knn, read_edges, read_fvecs, read_ivecs, read_nsg
 import torch
 import numpy as np
-from torch_geometric.utils import subgraph
+from torch_geometric.utils import subgraph, to_undirected
+
+
+# --------------------------------------------------------------------------- #
+# kNN graph: exact k-nearest-neighbors over the WHOLE graph (all N nodes) via
+# faiss. Built ONCE on the raw (pre-standardization) coordinates -- the space
+# the proximity graph was pruned in -- and cached to disk for reuse. Replaces
+# an O(N^2) torch.cdist scan: faiss.IndexFlatL2 is exact (same result as a
+# brute cdist topk) but blocked/SIMD-optimized and far lighter on memory.
+#
+# Returns (idx [N, k], dist [N, k]) on CPU. dist is EUCLIDEAN (sqrt of faiss'
+# squared L2) so it can be compared directly against a neighbor radius. The
+# self node sits at rank 0 with distance 0; callers pass k = topk + 1 to
+# absorb it.
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def build_knn_graph(coords, k, cache_path=None):
+    import faiss
+    n = coords.shape[0]
+    k = min(n, max(1, k))
+    if cache_path and os.path.exists(cache_path):
+        blob = np.load(cache_path)
+        idx, dist = blob['idx'], blob['dist']
+        if idx.shape == (n, k):
+            print(f"[KNN] loaded cache {cache_path} shape={idx.shape}")
+            return torch.from_numpy(idx).long(), torch.from_numpy(dist).float()
+        print(f"[KNN] cache {cache_path} shape {idx.shape} != {(n, k)}, rebuilding")
+
+    x = np.ascontiguousarray(coords.detach().cpu().numpy(), dtype='float32')
+    index = faiss.IndexFlatL2(x.shape[1])
+    index.add(x)
+    d2, idx = index.search(x, k)                 # d2: squared L2, idx: [N, k]
+    dist = np.sqrt(np.maximum(d2, 0.0))          # euclidean, matches radius test
+    if cache_path:
+        try:
+            np.savez(cache_path, idx=idx.astype('int64'), dist=dist.astype('float32'))
+            print(f"[KNN] built + cached {cache_path} shape={idx.shape}")
+        except Exception as ex:
+            print(f"[KNN] cache save skipped ({ex})")
+    return torch.from_numpy(idx.astype('int64')).long(), \
+           torch.from_numpy(dist.astype('float32')).float()
 
 class Graph:
     def __init__(self, vertices_path, edges_path,
@@ -85,11 +126,12 @@ class Graph:
 class pretrain_graph:
     def __init__(self, vertices_path, edges_path, graph_type='nsw',
                 train_prop=.5, valid_prop=.25,
-                vertices_size=None, normalization='global'):
+                vertices_size=None, normalization='global', undirected=False):
         """
         :param vertices_path: path to base datapoints
         :param normalization: normalization of base datapoints {'none', 'global', 'instance'}
         :param graph_type: supported graph types: {'nsw', 'nsg'}.
+        :param undirected: symmetrize edges before building the train subgraph.
         """
         self.graph_type = graph_type
         self.vertices = torch.tensor(read_fvecs(vertices_path, vertices_size))
@@ -116,6 +158,9 @@ class pretrain_graph:
                 dst.append(v)
         
         self.edges = torch.tensor([src, dst], dtype=torch.long)
+        if undirected:
+            self.edges = to_undirected(self.edges, num_nodes=self.vertices_size)
+            self.max_degree = int(torch.bincount(self.edges[0], minlength=self.vertices_size).max().item())
 
         # get the splits for all runs
         self.split_idx_lst = self.get_idx_split(train_prop=train_prop, valid_prop=valid_prop)
@@ -123,6 +168,7 @@ class pretrain_graph:
         # get train subgraph
         self.train_edges, self.node_map = subgraph(self.split_idx_lst['train'], 
                                                     self.edges, relabel_nodes=True)
+        pass
 
     def get_idx_split(self, split_type='random', train_prop=.5, valid_prop=.25):
         """
@@ -140,7 +186,85 @@ class pretrain_graph:
             perm = torch.as_tensor(np.random.permutation(n))
 
             train_indices = perm[:train_num]
-            val_indices = perm[train_num:train_num + valid_num]
-            test_indices = perm[train_num + valid_num:]
+            if(train_prop == 1):
+                val_indices=train_indices
+                test_indices=train_indices
+            else:
+                val_indices = perm[train_num:]
+                test_indices = perm[train_num:]
 
         return {'train':train_indices, 'valid':val_indices, 'test':test_indices}
+
+    # ----------------------------------------------------------------------- #
+    # Hard negatives: nodes that sit CLOSE to a source (inside the radius of
+    # its farthest true out-neighbor) yet are NOT connected to it. In a pruned
+    # proximity graph (NSW/HNSW) these are exactly the near points whose edges
+    # the build-time pruning heuristic dropped -- the most confusable
+    # non-neighbors, and the ones that force a model to learn the graph's
+    # topology rather than raw proximity.
+    #
+    # Computed on the FULL, ORIGINAL graph: all `vertices_size` nodes, raw
+    # `self.vertices` coordinates (never normalized/mutated by this class),
+    # and `self.edgeindex` (the original NSW/NSG adjacency, global node ids)
+    # as ground truth. This method is intentionally unaware of
+    # `self.split_idx_lst` / `self.train_edges` -- no train/valid/test
+    # filtering happens here, so it must be called before any caller mutates
+    # `self.vertices` (e.g. standardization). Callers that only want a
+    # training-node view should row-index the returned table by their own
+    # node subset afterwards (`table[train_idx]`); the columns stay GLOBAL
+    # node ids, they are not remapped to a compact/relabeled space.
+    #
+    # Returns a padded [vertices_size, max_pool] LongTensor of global node ids
+    # (-1 = empty slot), plus coverage (fraction of nodes with >=1 hard
+    # negative) and avg_pool (mean pool size among covered nodes) -- both
+    # measured over the full node set.
+    # ----------------------------------------------------------------------- #
+    @torch.no_grad()
+    def build_hard_negatives(self, hard_neg_topk=None, knn_cache_path=None, device=None):
+        n = self.vertices_size
+        topk = hard_neg_topk if hard_neg_topk and hard_neg_topk > 0 else self.max_degree
+        knn_idx, knn_dist = build_knn_graph(self.vertices, topk + 1, cache_path=knn_cache_path)
+
+        coords_cpu = self.vertices.detach().cpu()
+        knn_idx = knn_idx.cpu().tolist()
+        knn_dist = knn_dist.cpu().tolist()
+
+        pools = []
+        max_pool = 0
+        for gi in range(n):
+            nbr = set(self.edgeindex.get(gi, []))
+            if not nbr:
+                pools.append([])                    # no neighbor radius -> no hard neg
+                continue
+            # neighbor radius: distance to the farthest true out-neighbor
+            # (euclidean, raw coords).
+            nbr_idx = torch.tensor(sorted(nbr), dtype=torch.long)
+            d_max = torch.cdist(coords_cpu[gi:gi + 1], coords_cpu[nbr_idx]).max().item()
+            hard = []
+            for gc, dc in zip(knn_idx[gi], knn_dist[gi]):
+                if gc == gi or gc in nbr or dc >= d_max:
+                    continue
+                hard.append(gc)
+            pools.append(hard)
+            max_pool = max(max_pool, len(hard))
+
+        out_device = device if device is not None else self.vertices.device
+        if max_pool == 0:
+            table = torch.full((n, 1), -1, dtype=torch.long, device=out_device)
+            self.hard_neg_table, self.hard_neg_coverage, self.hard_neg_avg_pool = table, 0.0, 0.0
+            return self.hard_neg_table, self.hard_neg_coverage, self.hard_neg_avg_pool
+
+        table = torch.full((n, max_pool), -1, dtype=torch.long, device=out_device)
+        covered, total = 0, 0
+        for gi, hard in enumerate(pools):
+            if hard:
+                table[gi, :len(hard)] = torch.tensor(hard, dtype=torch.long, device=out_device)
+                covered += 1
+                total += len(hard)
+        coverage = covered / n
+        avg_pool = total / max(1, covered)
+
+        self.hard_neg_table = table
+        self.hard_neg_coverage = coverage
+        self.hard_neg_avg_pool = avg_pool
+        return self.hard_neg_table, self.hard_neg_coverage, self.hard_neg_avg_pool

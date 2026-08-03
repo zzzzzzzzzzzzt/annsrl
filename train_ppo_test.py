@@ -57,30 +57,32 @@ max_dcs = 1000            # reward hyperparameter
 # Agent params #
 ################
 
-hidden_size = 2048        # number of hidden units
+hidden_size = 256         # NodeFormer hidden / output dimension
+mlp_hidden_size = 2048     # edge MLP hidden dimension
+num_layers = 1            # number of NodeFormer message-passing layers
+num_heads = 4             # number of attention heads
+nb_random_features = 30   # random features for kernelized softmax
+use_bn = True             # layer normalization
+use_residual = True       # residual connections
 
 ####################
 # Algorithm params #
 ####################
 
-samples_in_batch = 85000  # Reduce for larger hidden_size to fit in GPU memory 
-Fvp_speedup = 5           # fraction of samples for Fisher vector product estimation 
-                          # Reflects on the iteration time (<10 is okay)
-                          # It significantly affects training time
-                          
-Fvp_min_batches = 10      # Min number of batches used for Fvp computation 
-                          # (min number of samples = Fvp_min_batches*samples_in_batch) 
-                          # Can be not met when total number of samples < Fvp_min_batches*samples_in_batch
-edge_patience = 400       # How many iterations are needed without the change of edge probability 
+samples_in_batch = 4096   # PPO mini-batch size per gradient step
+ppo_epochs = 2            # number of gradient passes over each session batch
+lr = 2e-4                 # Adam learning rate
+clip_eps = 0.1            # PPO clipping epsilon
+edge_patience = 400       # How many iterations are needed without the change of edge probability
                           # to denote the prediction as confident and make it deterministic
                           # Very important for training procedure efficiency
-                          
-Fvp_type = 'fim'          # Fisher vector product implementation: ['forward', 'fim']
-entropy_reg = 0.01        # coefficient in front of the entropy regularizer term 
-batch_size = 100000       # number of sessions per batch
 
-n_jobs = 8                # Number of threads for C++ sampling
-max_steps = 150          # Max number of training iterations
+entropy_reg = 0.01        # coefficient in front of the entropy regularizer term
+batch_size = 100000       # number of sessions per batch
+update_edges_every = 10   # call hnsw.update_edges() every N steps
+
+n_jobs = 32                # Number of threads for C++ sampling
+max_steps = 1000          # Max number of training iterations
 
 # Recover settings
 restore_step = None       # the iteration step from which you want to recover the model 
@@ -132,29 +134,40 @@ assert restore_step is not None or not os.path.exists('./runs/' + exp_name)
 hnsw = lib.ParallelHNSW(graph, ef=ef, k=k, edge_patience=edge_patience, n_jobs=n_jobs)
 
 if restore_step is not None:
-    agent = torch.load("runs/{}/agent.{}.pth".format(exp_name, restore_step))
-    baseline = torch.load("runs/{}/baseline.{}.pth".format(exp_name, restore_step))
-    hnsw.edge_confidence = torch.load("runs/{}/edge_confidence.{}.pth".format(exp_name, restore_step))
+    agent = torch.load("runs/{}/agent.{}.pth".format(exp_name, restore_step), weights_only=False)
+    baseline = torch.load("runs/{}/baseline.{}.pth".format(exp_name, restore_step), weights_only=False)
+    hnsw.edge_confidence = torch.load("runs/{}/edge_confidence.{}.pth".format(exp_name, restore_step), weights_only=False)
 else:
-    agent = lib.SimpleNeuralAgent(graph.vertices.shape[1], hidden_size=hidden_size)
+    agent = lib.NodeFormerAgent(
+        graph.vertices.shape[1],
+        hidden_size,
+        mlp_hidden_size,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        nb_random_features=nb_random_features,
+        use_bn=use_bn,
+        use_residual=use_residual,
+    )
     baseline = lib.SessionBaseline(graph.train_queries.size(0))
     
-reward = lib.ProximityDCSReward(graph.vertices, k=k, max_dcs=max_dcs, alpha=1.0, beta=1.0)
-trainer = lib.EfficientTRPO(agent, hnsw, reward, baseline,
-                            samples_in_batch=samples_in_batch,
-                            Fvp_type=Fvp_type,
-                            Fvp_speedup=Fvp_speedup,
-                            Fvp_min_batches=Fvp_min_batches,
-                            entropy_reg=entropy_reg,
-                            writer=SummaryWriter('./runs/' + exp_name))
+reward = lib.MaxDCSReward(k=k, max_dcs=max_dcs)
+trainer = lib.OptimizedPPO(agent, hnsw, reward, baseline,
+                lr=lr,
+                clip_eps=clip_eps,
+                ppo_epochs=ppo_epochs,
+                samples_in_batch=samples_in_batch,
+                entropy_reg=entropy_reg,
+                target_kl=0.015,                   # 加入早停保障
+                warmup_steps=2,                   # 冷启动：先预热baseline再更新模型
+                writer=SummaryWriter('./runs/' + exp_name))
 
 if restore_step is not None:
     trainer.step = restore_step
 
 from pandas import DataFrame
-from IPython.display import clear_output
+import matplotlib
+matplotlib.use('Agg')  # headless: script is run from the terminal, not a notebook
 import matplotlib.pyplot as plt
-# %matplotlib inline
 moving_average = lambda x, **kw: DataFrame({'x':np.asarray(x)}).x.ewm(**kw).mean().values
 reward_history = []
 best_val_step = 0
@@ -177,6 +190,10 @@ for batch_queries, batch_gt, batch_query_ids in train_batcher:
     torch.cuda.empty_cache()
     mean_reward = trainer.train_step(batch_queries, batch_gt, query_index=batch_query_ids)
     reward_history.append(mean_reward)
+
+    # if trainer.step % update_edges_every == 0:
+    #     promoted = hnsw.update_edges()
+    #     trainer.writer.add_scalar('train/promoted_edges', promoted, global_step=trainer.step)
         
     if trainer.step % 10 == 0:
         val_reward = trainer.evaluate(*next(val_iterator), prefix='val')
@@ -195,13 +212,14 @@ for batch_queries, batch_gt, batch_query_ids in train_batcher:
         print('Done!')
     
     if trainer.step % 1 == 0:
-        clear_output(True)
+        plt.figure()
         plt.title('train reward over time')
         plt.plot(moving_average(reward_history, span=50))
         plt.scatter(range(len(reward_history)), reward_history, alpha=0.1)
         plt.grid()
-        plt.show()
-        print("step=%i, mean_reward=%.3f, time=%.3f" % 
+        plt.savefig("runs/{}/reward.png".format(exp_name))
+        plt.close()
+        print("step=%i, mean_reward=%.3f, time=%.3f" %
               (trainer.step, np.mean(reward_history[-100:]), time.time()-start))
     
     if trainer.step >= max_steps: break
@@ -209,8 +227,8 @@ for batch_queries, batch_gt, batch_query_ids in train_batcher:
 #protip: run tensorboard in ./runs to get all metrics.
 
 print("Best step on validation: %d" % best_val_step)
-agent = torch.load("runs/{}/agent.{}.pth".format(exp_name, best_val_step))
-hnsw.edge_confidence = torch.load("runs/{}/edge_confidence.{}.pth".format(exp_name, best_val_step))
+agent = torch.load("runs/{}/agent.{}.pth".format(exp_name, best_val_step), weights_only=False)
+hnsw.edge_confidence = torch.load("runs/{}/edge_confidence.{}.pth".format(exp_name, best_val_step), weights_only=False)
 trainer.step = best_val_step
 
 from collections import defaultdict
