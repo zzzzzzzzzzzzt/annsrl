@@ -113,5 +113,5 @@ def parser_add_main_args(parser):
                     help='activation for topology')
     parser.add_argument('--topology_factor', type=float, default=0.2,
                         help='factor for topology')
-    parser.add_argument('--Loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator', 'sigmoid_loss'],
+    parser.add_argument('--loss_function', type=str, default='degree_log', choices=['degree_log', 'contrastive', 'contrastive_only_numerator', 'sigmoid_loss'],
                     help='loss function for edge loss')

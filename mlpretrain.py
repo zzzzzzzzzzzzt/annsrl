@@ -20,7 +20,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 from lib.parse import parser_add_main_args
 from lib.graph import pretrain_graph
@@ -168,63 +167,18 @@ def bce_edge_loss(model, z, pos_edges, num_nodes, neg_per_pos):
 # to the positive and all negatives cancels in the softmax, so dot_bias receives
 # no gradient under this loss.
 # --------------------------------------------------------------------------- #
-def _sample_hard_negatives(src, hard_neg_table, hard_neg_per_pos, num_global_nodes):
-    """For each COMPACT source node in `src` [E], draw `hard_neg_per_pos`
-    hard-negative destinations from its precomputed pool (a padded [E_rows, P]
-    table row-indexed by train position, columns holding GLOBAL node ids,
-    -1 = empty -- see pretrain_graph.build_hard_negatives). Slots that fall on
-    padding (short pool) are backfilled with random GLOBAL node ids so every
-    positive edge gets exactly `hard_neg_per_pos` hard columns.
-    Returns a [E, hard_neg_per_pos] LongTensor of GLOBAL destination node ids."""
-    device = src.device
-    pool = hard_neg_table[src]                                  # [E, P], global ids
-    pool_size = pool.shape[1]
-    # random column indices into the pool, one set per requested hard negative
-    col = torch.randint(0, pool_size, (src.shape[0], hard_neg_per_pos), device=device)
-    dst = torch.gather(pool, 1, col)                            # [E, H], may hold -1
-    # backfill padding (-1) with uniform random GLOBAL node ids
-    pad = dst < 0
-    if pad.any():
-        rand = torch.randint(0, num_global_nodes, (int(pad.sum().item()),), device=device)
-        dst = dst.clone()
-        dst[pad] = rand
-    return dst
-
-
-def infonce_edge_loss(model, z, pos_edges, num_nodes, neg_per_pos, temperature=1.0,
-                      hard_neg_table=None, hard_neg_per_pos=0,
-                      z_full=None, train_idx=None):
+def infonce_edge_loss(model, z, pos_edges, num_nodes, neg_per_pos, temperature=1.0):
     pos_logits = model.edge_logits(z, pos_edges)          # [E]
-    total_neg = neg_per_pos + (hard_neg_per_pos if hard_neg_table is not None else 0)
-    if total_neg <= 0 or num_nodes <= 1:
+    if neg_per_pos <= 0 or num_nodes <= 1:
         return pos_logits.sum() * 0.0
 
-    src = pos_edges[0]                                     # [E], compact train ids
-    neg_cols = []
+    neg_src = pos_edges[0].repeat_interleave(neg_per_pos)
+    neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
+    neg_edges = torch.stack([neg_src, neg_dst], dim=0)
+    neg_logits = model.edge_logits(z, neg_edges)          # [E * K]
 
-    # Random negatives: uniform over all (compact) nodes.
-    if neg_per_pos > 0:
-        rand_src = src.repeat_interleave(neg_per_pos)
-        rand_dst = torch.randint(0, num_nodes, (rand_src.numel(),), device=z.device)
-        rand_logits = model.edge_logits(z, torch.stack([rand_src, rand_dst], dim=0))
-        neg_cols.append(rand_logits.view(-1, neg_per_pos))          # [E, R]
-
-    # Hard negatives: near-but-pruned nodes drawn from each source's pool.
-    # hard_neg_table columns are GLOBAL node ids (pretrain_graph.build_hard_negatives
-    # computes them on the full original graph, unaware of the compact train-node
-    # relabeling), so they are scored against z_full/train-mapped-to-global src,
-    # not the compact z used for positives/random negatives above.
-    if hard_neg_table is not None and hard_neg_per_pos > 0:
-        assert z_full is not None and train_idx is not None, \
-            "z_full and train_idx are required to score global-id hard negatives"
-        num_global_nodes = z_full.shape[0]
-        hard_dst = _sample_hard_negatives(src, hard_neg_table, hard_neg_per_pos, num_global_nodes)
-        hard_src_global = train_idx[src].view(-1, 1).expand(-1, hard_neg_per_pos)  # [E, H]
-        hard_logits = model.edge_logits(z_full, torch.stack([hard_src_global.reshape(-1),
-                                                              hard_dst.reshape(-1)], dim=0))
-        neg_cols.append(hard_logits.view(-1, hard_neg_per_pos))     # [E, H]
-
-    logits = torch.cat([pos_logits.view(-1, 1)] + neg_cols, dim=1)  # [E, 1 + R + H]
+    logits = torch.cat([pos_logits.view(-1, 1),
+                        neg_logits.view(-1, neg_per_pos)], dim=1)  # [E, 1 + K]
     logits = logits / temperature
     labels = torch.zeros(logits.shape[0], dtype=torch.long, device=z.device)
     return F.cross_entropy(logits, labels)
@@ -251,17 +205,6 @@ def build_out_neighbors(edge_index, num_nodes, device):
     neighbor_tensors = [torch.tensor(sorted(v), dtype=torch.long, device=device) for v in neighbors]
     degrees = torch.tensor([len(v) for v in neighbors], dtype=torch.long, device=device)
     return neighbor_tensors, degrees
-
-
-# --------------------------------------------------------------------------- #
-# Hard negatives: near-but-pruned non-neighbors, mined once on the FULL
-# original graph. See pretrain_graph.build_hard_negatives (lib/graph.py) for
-# the implementation -- it computes the pool from raw coordinates and the
-# original NSW/NSG adjacency, with no train/valid/test awareness. The pool
-# returned here is row-indexed by train_idx in main() below; its columns stay
-# GLOBAL node ids (not remapped to compact train ids), so the InfoNCE loss
-# scores hard-negative destinations against z_full rather than the compact z.
-# --------------------------------------------------------------------------- #
 
 
 @torch.no_grad()
@@ -294,62 +237,36 @@ def topn_neighbor_ratio(model, z, node_idx, out_neighbors, out_degree, batch_siz
 
 
 @torch.no_grad()
-def edge_probs(model, z, edge_index, mask, num_nodes, neg_per_pos=1, batch_size=10000):
+def edge_probs(model, z, edge_index, mask, num_nodes, neg_per_pos=1):
     """Mean sigmoid(logit) on the masked true edges vs. random negatives from the
     same sources -- a quick read on how well positives separate from noise."""
     if not mask.any():
         return 0.0, 0.0
     sub = edge_index[:, mask]
-    pos_sum = 0.0
-    neg_sum = 0.0
-    pos_count = 0
-    neg_count = 0
-    batch_size = max(1, int(batch_size))
+    pos_prob = torch.sigmoid(model.edge_logits(z, sub)).mean().item()
 
-    for start in range(0, sub.shape[1], batch_size):
-        edge_batch = sub[:, start:start + batch_size]
-        pos_prob = torch.sigmoid(model.edge_logits(z, edge_batch))
-        pos_sum += float(pos_prob.sum().item())
-        pos_count += int(pos_prob.numel())
-
-        neg_src = edge_batch[0].repeat_interleave(max(1, neg_per_pos))
-        neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
-        neg = torch.stack([neg_src, neg_dst], dim=0)
-        neg_prob = torch.sigmoid(model.edge_logits(z, neg))
-        neg_sum += float(neg_prob.sum().item())
-        neg_count += int(neg_prob.numel())
-
-    return pos_sum / pos_count, neg_sum / neg_count
+    neg_src = sub[0].repeat_interleave(max(1, neg_per_pos))
+    neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
+    neg = torch.stack([neg_src, neg_dst], dim=0)
+    neg_prob = torch.sigmoid(model.edge_logits(z, neg)).mean().item()
+    return pos_prob, neg_prob
 
 
 @torch.no_grad()
-def edge_scores(model, z, edge_index, mask, num_nodes, neg_per_pos=1, batch_size=10000):
+def edge_scores(model, z, edge_index, mask, num_nodes, neg_per_pos=1):
     """Raw-score counterpart of edge_probs (no sigmoid): mean edge_logit on true
     edges vs. random negatives. Use with InfoNCE, which optimizes relative
     ranking rather than calibrated probabilities, so sigmoid would be misleading."""
     if not mask.any():
         return 0.0, 0.0
     sub = edge_index[:, mask]
-    pos_sum = 0.0
-    neg_sum = 0.0
-    pos_count = 0
-    neg_count = 0
-    batch_size = max(1, int(batch_size))
+    pos_score = model.edge_logits(z, sub).mean().item()
 
-    for start in range(0, sub.shape[1], batch_size):
-        edge_batch = sub[:, start:start + batch_size]
-        pos_score = model.edge_logits(z, edge_batch)
-        pos_sum += float(pos_score.sum().item())
-        pos_count += int(pos_score.numel())
-
-        neg_src = edge_batch[0].repeat_interleave(max(1, neg_per_pos))
-        neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
-        neg = torch.stack([neg_src, neg_dst], dim=0)
-        neg_score = model.edge_logits(z, neg)
-        neg_sum += float(neg_score.sum().item())
-        neg_count += int(neg_score.numel())
-
-    return pos_sum / pos_count, neg_sum / neg_count
+    neg_src = sub[0].repeat_interleave(max(1, neg_per_pos))
+    neg_dst = torch.randint(0, num_nodes, (neg_src.numel(),), device=z.device)
+    neg = torch.stack([neg_src, neg_dst], dim=0)
+    neg_score = model.edge_logits(z, neg).mean().item()
+    return pos_score, neg_score
 
 
 # --------------------------------------------------------------------------- #
@@ -391,37 +308,6 @@ def save_history(history, run, args):
 
 
 # --------------------------------------------------------------------------- #
-# Checkpoint: persist the best model so train_sift100k_ppo.py can warm-start the
-# PPO agent from it. The dict layout mirrors exactly what that script's loader
-# (lib.MLPLinkAgent reconstruction) reads: the state_dict plus every architecture
-# hyperparameter needed to rebuild an identically-shaped agent, plus the
-# feature standardization (mean/std) applied to coordinates during pretraining
-# -- the agent re-applies it inside its own encode() at PPO time.
-# --------------------------------------------------------------------------- #
-def save_checkpoint(best_state, mean, std, args, in_channels, path, extra=None):
-    if best_state is None:
-        print(f"[BEST_MODEL] no best_state to save at {path}")
-        return
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    ckpt = {
-        'state_dict': best_state,
-        'in_channels': in_channels,
-        'node_hidden': args.node_hidden,
-        'node_layers': args.node_layers,
-        'pair_hidden': args.pair_hidden,
-        'scorer': args.scorer,
-        'norm': args.norm,
-        'dropout': args.dropout,
-        'mean': mean.detach().cpu(),
-        'std': std.detach().cpu(),
-    }
-    if extra:
-        ckpt.update(extra)
-    torch.save(ckpt, path)
-    print(f"[BEST_MODEL] saved {path}")
-
-
-# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -448,14 +334,6 @@ def main():
                              "'infonce'=softmax over 1 pos + K neg per source (raw-score monitoring)")
     parser.add_argument('--infonce_temp', type=float, default=0.1,
                         help='softmax temperature for the InfoNCE loss (only used when --loss infonce)')
-    parser.add_argument('--hard_neg_per_pos', type=int, default=5,
-                        help='hard negatives per positive edge for InfoNCE: near-but-pruned '
-                             'nodes drawn from each source pool (0 disables, pure random negatives)')
-    parser.add_argument('--hard_neg_topk', type=int, default=0,
-                        help='nearest-candidate range for building the hard-negative pool '
-                             '(0 -> fall back to --hnsw_m)')
-    parser.add_argument('--knncache', type=str, default='',
-                        help='path to cache the kNN for hard negatives (default: no caching)')
     args = parser.parse_args()
     args.output_timestamp = os.environ.get('RUN_TIMESTAMP', time.strftime('%Y%m%d_%H%M%S'))
     print(args)
@@ -473,31 +351,6 @@ def main():
 
     dataset.vertices = dataset.vertices.to(device)
 
-    train_idx = dataset.split_idx_lst['train'].to(device)
-    valid_idx = dataset.split_idx_lst['valid'].to(device)
-    test_idx = dataset.split_idx_lst['test'].to(device)
-
-    # Precompute the hard-negative pool ONCE (parameter-independent), on the
-    # FULL original graph -- raw coordinates and the original NSW/NSG
-    # adjacency, unaware of the train/valid/test split. Must run BEFORE
-    # standardization below: pretrain_graph.build_hard_negatives assumes
-    # self.vertices are still the untouched raw coordinates the proximity
-    # graph was pruned in (see lib/graph.py). The full table is then
-    # row-indexed by train_idx -- its columns stay GLOBAL node ids.
-    hard_neg_table = None
-    if args.loss == 'infonce' and args.hard_neg_per_pos > 0:
-        hard_topk = args.hard_neg_topk if args.hard_neg_topk > 0 else args.hnsw_m
-        # Cache key ties to the dataset + k so a stale cache can't silently
-        # feed the wrong graph.
-        knn_cache = os.path.join(args.knncache,
-                                 f"knn_{args.dataset}_k{hard_topk + 1}.npz")
-        os.makedirs(os.path.dirname(knn_cache), exist_ok=True)
-        full_hard_neg_table, hard_cov, hard_avg = dataset.build_hard_negatives(
-            hard_neg_topk=hard_topk, knn_cache_path=knn_cache)
-        hard_neg_table = full_hard_neg_table[train_idx.cpu()].to(device)
-        print(f"[HARD_NEG] topk={hard_topk} coverage={hard_cov:.3f} "
-              f"avg_pool={hard_avg:.2f} table={tuple(hard_neg_table.shape)}")
-
     # Force feature standardization: skewed raw coordinates can starve the
     # encoder of gradient. Zero-mean/unit-std per feature dimension.
     mean = dataset.vertices.mean(dim=0, keepdim=True)
@@ -506,16 +359,17 @@ def main():
 
     dataset.edges = dataset.edges.to(device)
     dataset.train_edges = dataset.train_edges.to(device)
+    train_idx = dataset.split_idx_lst['train'].to(device)
+    valid_idx = dataset.split_idx_lst['valid'].to(device)
+    test_idx = dataset.split_idx_lst['test'].to(device)
 
     # number of nodes in the (relabeled) train subgraph used for the loss
     num_train_nodes = int(train_idx.numel())
-    train_edge_ids = torch.arange(dataset.train_edges.shape[1], dtype=torch.long)
-    train_edge_dataset = TensorDataset(train_edge_ids)
     out_neighbors, out_degree = build_out_neighbors(dataset.edges, n, device)
 
     model = MLPLinkNet(d, node_hidden=args.node_hidden, node_layers=args.node_layers,
                        pair_hidden=args.pair_hidden, dropout=args.dropout,
-                       scorer=args.scorer, norm=args.norm).to(device)
+                       scorer=args.scorer).to(device)
     print('MODEL:', model)
     logger = Logger(args.runs, args)
 
@@ -524,19 +378,6 @@ def main():
     valid_mask = torch.isin(edge_src, valid_idx)
     test_mask = torch.isin(edge_src, test_idx)
 
-    # Read-only monitoring probe: a fixed random subset of train nodes on which
-    # the (expensive) top-N neighbor recall is cheap enough to compute every
-    # eval step. Purely diagnostic -- it does NOT feed model selection.
-    probe_g = torch.Generator().manual_seed(0)
-    probe_idx = train_idx[torch.randperm(train_idx.numel(), generator=probe_g)[:2000].to(device)]
-
-    # Canonical best-model path (overwritten whenever a run beats the best
-    # validation top-N recall seen so far). train_sift100k_ppo.py loads this
-    # exact path -- keep the naming scheme in sync with that script.
-    best_ckpt_path = os.path.join(
-        args.model_dir, f"mlplink_{args.dataset}_{args.scorer}_best.pth")
-    best_overall_val = float('-inf')
-
     for run in range(args.runs):
         model.reset_parameters()
         optimizer = torch.optim.Adam(model.parameters(), weight_decay=args.weight_decay, lr=args.lr)
@@ -544,44 +385,21 @@ def main():
         best_state = None
         best_epoch = -1
         history = []
-        train_edge_loader = DataLoader(
-            train_edge_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=False,
-        )
 
         for epoch in range(args.epochs):
             model.train()
-            num_batches = len(train_edge_loader)
-            loss_value = 0.0
-
-            for batch_id, (batch_idx,) in enumerate(train_edge_loader):
-                optimizer.zero_grad()
-                # Encode all nodes, then gather train nodes because train_edges
-                # is relabeled into the compact train-node index space. This has
-                # to happen INSIDE the batch loop: the parameters move after
-                # every optimizer.step(), so a per-epoch encode would feed stale
-                # embeddings to every batch but the first.
-                z_full = model.encode(dataset.vertices)
-                z = z_full[train_idx]
-
-                batch_idx = batch_idx.to(device)
-                edge_batch = dataset.train_edges[:, batch_idx]
-                if args.loss == 'infonce':
-                    batch_loss = infonce_edge_loss(model, z, edge_batch, num_train_nodes,
-                                                   args.neg_per_pos, temperature=args.infonce_temp,
-                                                   hard_neg_table=hard_neg_table,
-                                                   hard_neg_per_pos=args.hard_neg_per_pos,
-                                                   z_full=z_full, train_idx=train_idx)
-                else:
-                    batch_loss = bce_edge_loss(model, z, edge_batch, num_train_nodes, args.neg_per_pos)
-
-                # scaled_loss = batch_loss * (edge_batch.shape[1] / total_edges)
-                batch_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                loss_value += float(batch_loss.detach())
+            optimizer.zero_grad()
+            # train on the compacted train subgraph, exactly like pretrain.py:
+            # dataset.train_edges is relabeled into the train-node index space.
+            z = model.encode(dataset.vertices[train_idx])
+            if args.loss == 'infonce':
+                loss = infonce_edge_loss(model, z, dataset.train_edges, num_train_nodes,
+                                         args.neg_per_pos, temperature=args.infonce_temp)
+            else:
+                loss = bce_edge_loss(model, z, dataset.train_edges, num_train_nodes, args.neg_per_pos)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
             if epoch % args.eval_step == 0 and epoch > 0:
                 model.eval()
@@ -593,30 +411,24 @@ def main():
                 with torch.no_grad():
                     z_full = model.encode(dataset.vertices)
                     monitor = edge_scores if args.loss == 'infonce' else edge_probs
-                    train_pos, train_neg = monitor(model, z_full, dataset.edges, train_mask, n,
-                                                   args.neg_per_pos, args.batch_size)
-                    valid_pos, valid_neg = monitor(model, z_full, dataset.edges, valid_mask, n,
-                                                   args.neg_per_pos, args.batch_size)
-                    probe_topn = topn_neighbor_ratio(model, z_full, probe_idx,
-                                                     out_neighbors, out_degree)
+                    train_pos, train_neg = monitor(model, z_full, dataset.edges, train_mask, n, args.neg_per_pos)
+                    valid_pos, valid_neg = monitor(model, z_full, dataset.edges, valid_mask, n, args.neg_per_pos)
 
                 # Model selection on validation positive score (how confidently
                 # the model scores true valid edges), not the pos-neg gap.
                 history.append({
-                    'epoch': epoch, 'loss': loss_value,
+                    'epoch': epoch, 'loss': loss.item(),
                     'train_pos_prob': train_pos, 'train_neg_prob': train_neg,
                     'valid_pos_prob': valid_pos, 'valid_neg_prob': valid_neg,
-                    'probe_topn': probe_topn,
                 })
                 if valid_pos > best_val:
                     best_val = valid_pos
                     best_epoch = epoch
                     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-                print(f'Epoch: {epoch:03d}, Loss: {loss_value:.6f}, '
+                print(f'Epoch: {epoch:03d}, Loss: {loss.item():.6f}, '
                       f'PosProb(tr/va): {train_pos:.4f}/{valid_pos:.4f}, '
-                      f'NegProb(tr/va): {train_neg:.4f}/{valid_neg:.4f}, '
-                      f'ProbeTopN: {probe_topn:.4f}')
+                      f'NegProb(tr/va): {train_neg:.4f}/{valid_neg:.4f}')
 
         # Compute the expensive top-N neighbor recall exactly once, on the best
         # model as selected by validation positive score.
@@ -632,22 +444,6 @@ def main():
               f'train: {train_topn:.6f}  valid: {valid_topn:.6f}  test: {test_topn:.6f}')
         # Logger tracks top-N recall in the (train, valid, test, loss) slots.
         logger.add_result(run, (train_topn, valid_topn, test_topn, best_val))
-
-        # Persist this run's best model. `mean`/`std` are the standardization
-        # stats computed above (before dataset.vertices was overwritten). Model
-        # selection across runs uses validation top-N recall, the metric that
-        # actually reflects neighbor-recovery quality.
-        metrics = {'train_topn': train_topn, 'valid_topn': valid_topn,
-                   'test_topn': test_topn, 'best_val': best_val,
-                   'best_epoch': best_epoch, 'run': run}
-        run_ckpt_path = os.path.join(
-            args.model_dir, f"mlplink_{args.dataset}_{args.scorer}_run{run:02d}.pth")
-        save_checkpoint(best_state, mean, std, args, d, run_ckpt_path, extra=metrics)
-        if valid_topn > best_overall_val:
-            best_overall_val = valid_topn
-            save_checkpoint(best_state, mean, std, args, d, best_ckpt_path, extra=metrics)
-            print(f"[BEST_MODEL] run {run} is new best (valid top-N {valid_topn:.6f}) "
-                  f"-> {best_ckpt_path}")
 
         save_history(history, run, args)
         logger.print_statistics(run)

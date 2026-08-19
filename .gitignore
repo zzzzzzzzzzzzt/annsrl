@@ -3,6 +3,7 @@ lib/__pycache__/*
 lib/search_hnsw_swig/*
 results/*
 log/*
+mdlog/*.md
 data/*
 notebooks/*
 
@@ -12,6 +13,7 @@ scripts
 
 # training artifacts / checkpoints / build outputs
 __pycache__/
+*.py[cod]
 runs/
 models/
 index/
