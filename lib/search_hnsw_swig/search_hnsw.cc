@@ -14,7 +14,8 @@ void find_nearest(int nb, int d1, float *vertices,               // matrix [n_ve
                   int *k,                                        // number
                   int *initial_vertex_id,                        // number
                   int *ef,                                       // number
-                  int *nt)                                       // number
+                  int *nt,                                       // number
+                  int *max_dcs)                                  // number, <=0 means unlimited
                   {
     assert(nq == nq1 == nq2 == nq3);
     assert(d == d1);
@@ -22,6 +23,12 @@ void find_nearest(int nb, int d1, float *vertices,               // matrix [n_ve
     assert(max_degree ==  max_degree1);
     assert(*nt > 0 && *ef > 0);
     assert(*k <= *ef);
+    // A hard distance-computation budget. The entry point already costs 1 dcs, so a
+    // budget below 1 could never be honoured; <=0 disables the cap entirely and
+    // reproduces the pre-budget kernel bit for bit.
+    const bool capped = (*max_dcs > 0);
+    const size_t dcs_budget = capped ? (size_t) *max_dcs : 0;
+    assert(!capped || dcs_budget >= 1);
 
 #pragma omp parallel for num_threads(*nt)
     for (int32_t q = 0; q < nq; q++) {
@@ -49,6 +56,7 @@ void find_nearest(int nb, int d1, float *vertices,               // matrix [n_ve
         visited_ids.insert(*initial_vertex_id);
         float lowerBound = distance;
 
+        bool budget_hit = false;
         while (!candidates.empty()) {
             idx_t vertex_id = candidates.top().second;
             if (-candidates.top().first > lowerBound)
@@ -76,6 +84,18 @@ void find_nearest(int nb, int d1, float *vertices,               // matrix [n_ve
                 *action = prob > sample;
                 if (*action == 0) continue;
 
+                // Budget check goes here, BEFORE the distance is computed, so num_dcs
+                // can never exceed the cap -- stopping only at hop boundaries would
+                // overshoot by up to max_degree (24 on this graph, i.e. 8% of a 300
+                // budget). The edge is rewritten to "unused" because the walk never
+                // actually evaluated it; leaving it as a taken action would feed
+                // record_sessions an edge with no distance computation behind it.
+                if (capped && num_dcs >= dcs_budget) {
+                    *action = -2;
+                    budget_hit = true;
+                    break;
+                }
+
                 visited_ids.insert(neighbor_id);
                 if (d == 300)  // Hard code for GloVe data
                     distance = fvec_negative_dot(query, vertices + d * neighbor_id, d);
@@ -94,7 +114,11 @@ void find_nearest(int nb, int d1, float *vertices,               // matrix [n_ve
                 if (prob > 1)
                     *action = -2;
             }
+            // Recorded even when the budget cut this hop short: the vertex WAS popped
+            // and expanded, and credit_nodes reads trajectory[:num_hops], so skipping
+            // it would silently drop the node that spent the last of the budget.
             trajectory[num_hops++] = vertex_id;
+            if (budget_hit) break;
             if (num_hops >= (size_t) max_path) break;
         }
 

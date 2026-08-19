@@ -43,4 +43,5 @@ void find_nearest(int nb, int d1, float *vertices,               // matrix [n_ve
                   int *k,                                        // number
                   int *initial_vertex_id,                        // number
                   int *ef,                                       // number
-                  int *nt);                                      // number
+                  int *nt,                                       // number
+                  int *max_dcs);                                 // number, <=0 means unlimited

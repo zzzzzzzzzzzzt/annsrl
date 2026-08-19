@@ -525,6 +525,12 @@ def main():
     valid_mask = torch.isin(edge_src, valid_idx)
     test_mask = torch.isin(edge_src, test_idx)
 
+    # Read-only monitoring probe: a fixed random subset of train nodes on which
+    # the (expensive) top-N neighbor recall is cheap enough to compute every
+    # eval step. Purely diagnostic -- it does NOT feed model selection.
+    probe_g = torch.Generator().manual_seed(0)
+    probe_idx = train_idx[torch.randperm(train_idx.numel(), generator=probe_g)[:2000].to(device)]
+
     # Canonical best-model path (overwritten whenever a run beats the best
     # validation top-N recall seen so far). train_sift100k_ppo.py loads this
     # exact path -- keep the naming scheme in sync with that script.
@@ -548,17 +554,19 @@ def main():
 
         for epoch in range(args.epochs):
             model.train()
-            optimizer.zero_grad()
-            # Encode all nodes, then gather train nodes because train_edges is
-            # relabeled into the compact train-node index space.
-            z_full = model.encode(dataset.vertices)
-            z = z_full[train_idx]
-
-            total_edges = dataset.train_edges.shape[1]
             num_batches = len(train_edge_loader)
             loss_value = 0.0
 
             for batch_id, (batch_idx,) in enumerate(train_edge_loader):
+                optimizer.zero_grad()
+                # Encode all nodes, then gather train nodes because train_edges
+                # is relabeled into the compact train-node index space. This has
+                # to happen INSIDE the batch loop: the parameters move after
+                # every optimizer.step(), so a per-epoch encode would feed stale
+                # embeddings to every batch but the first.
+                z_full = model.encode(dataset.vertices)
+                z = z_full[train_idx]
+
                 batch_idx = batch_idx.to(device)
                 edge_batch = dataset.train_edges[:, batch_idx]
                 if args.loss == 'infonce':
@@ -571,10 +579,10 @@ def main():
                     batch_loss = bce_edge_loss(model, z, edge_batch, num_train_nodes, args.neg_per_pos)
 
                 # scaled_loss = batch_loss * (edge_batch.shape[1] / total_edges)
-                batch_loss.backward(retain_graph=batch_id < num_batches - 1)
+                batch_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
                 loss_value += float(batch_loss.detach())
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
 
             if epoch % args.eval_step == 0 and epoch > 0:
                 model.eval()
@@ -590,6 +598,8 @@ def main():
                                                    args.neg_per_pos, args.batch_size)
                     valid_pos, valid_neg = monitor(model, z_full, dataset.edges, valid_mask, n,
                                                    args.neg_per_pos, args.batch_size)
+                    probe_topn = topn_neighbor_ratio(model, z_full, probe_idx,
+                                                     out_neighbors, out_degree)
 
                 # Model selection on validation positive score (how confidently
                 # the model scores true valid edges), not the pos-neg gap.
@@ -597,6 +607,7 @@ def main():
                     'epoch': epoch, 'loss': loss_value,
                     'train_pos_prob': train_pos, 'train_neg_prob': train_neg,
                     'valid_pos_prob': valid_pos, 'valid_neg_prob': valid_neg,
+                    'probe_topn': probe_topn,
                 })
                 if valid_pos > best_val:
                     best_val = valid_pos
@@ -605,7 +616,8 @@ def main():
 
                 print(f'Epoch: {epoch:03d}, Loss: {loss_value:.6f}, '
                       f'PosProb(tr/va): {train_pos:.4f}/{valid_pos:.4f}, '
-                      f'NegProb(tr/va): {train_neg:.4f}/{valid_neg:.4f}')
+                      f'NegProb(tr/va): {train_neg:.4f}/{valid_neg:.4f}, '
+                      f'ProbeTopN: {probe_topn:.4f}')
 
         # Compute the expensive top-N neighbor recall exactly once, on the best
         # model as selected by validation positive score.

@@ -45,6 +45,85 @@ def build_knn_graph(coords, k, cache_path=None):
     return torch.from_numpy(idx.astype('int64')).long(), \
            torch.from_numpy(dist.astype('float32')).float()
 
+# --------------------------------------------------------------------------- #
+# Initial-topology builders.
+#
+# The graph-edit MDP (framework.md / lib.algorithm.GraphEditPPO) treats the
+# topology as the state it learns to improve, so s_0 does NOT have to be a good
+# proximity graph -- and using a pruned HNSW/NSG graph as s_0 conflates "what the
+# agent learned" with "what the construction heuristic already knew". These build
+# s_0 from scratch instead, at a fixed out-degree so the bounded-swap degree
+# invariant has a well-defined starting point.
+# --------------------------------------------------------------------------- #
+def build_random_edges(num_vertices, degree, seed=None):
+    """ Uniformly random out-edges: the weakest possible s_0 (no distance info).
+
+    Each node gets exactly `degree` distinct non-self neighbours, so the agent has
+    to discover proximity structure entirely on its own.
+    """
+    degree = int(min(max(degree, 1), num_vertices - 1))
+    rng = np.random.default_rng(seed)
+
+    # Oversample + dedup is much faster than a per-node rng.choice; with
+    # degree << num_vertices a single pass almost always fills every row.
+    pool = rng.integers(0, num_vertices, size=(num_vertices, degree * 2), dtype=np.int64)
+    self_ids = np.arange(num_vertices, dtype=np.int64)[:, None]
+    pool[pool == self_ids] = -1                     # mark self-loops for removal
+    pool.sort(axis=1)
+    keep = np.ones_like(pool, dtype=bool)
+    keep[:, 1:] = pool[:, 1:] != pool[:, :-1]       # drop duplicates
+    keep &= pool >= 0
+    # The sort above was only a device for deduplication, so the surviving ids sit in
+    # ascending order: compacting them left and taking the first `degree` would keep
+    # the SMALLEST ids of each row and starve the top of the id range of in-edges
+    # entirely. Measured on N=100k, degree=24: mean neighbour id 25525 instead of
+    # 50000, no id above 78324 ever sampled, 35% of nodes with in-degree 0, and
+    # reachable_frac stuck at 0.65 no matter what the agent does. Draw `degree` of
+    # the kept slots uniformly at random instead -- random keys on kept slots and
+    # +inf on the rest, so the kept ids come first in random order.
+    order = np.argsort(np.where(keep, rng.random(pool.shape), np.inf), axis=1)
+    pool = np.take_along_axis(pool, order, axis=1)
+    counts = keep.sum(1)
+
+    edges = {}
+    short = np.flatnonzero(counts < degree)
+    for v in range(num_vertices):
+        edges[v] = pool[v, :degree].tolist()
+    # Rare rows that deduplicated below `degree` get an exact resample.
+    for v in short:
+        choice = rng.choice(num_vertices - 1, size=degree, replace=False)
+        choice[choice >= v] += 1                    # skip self without resampling
+        edges[int(v)] = choice.astype(np.int64).tolist()
+    return edges
+
+
+def build_knn_edges(vertices, degree, cache_path=None, n_jobs=1):
+    """ Exact kNN out-edges: a strong *local* s_0 with no long-range links.
+
+    A pure kNN graph is highly clustered and poorly navigable -- search from a
+    fixed entry point tends to get stuck in the entry point's neighbourhood -- so
+    it isolates exactly what the agent has to learn: which few edges to trade for
+    long-range connectivity.
+    """
+    num_vertices = vertices.shape[0]
+    degree = int(min(max(degree, 1), num_vertices - 1))
+
+    # k = degree + 1 to absorb the self match at rank 0.
+    try:
+        idx, _ = build_knn_graph(vertices, degree + 1, cache_path=cache_path)
+        idx = idx.numpy()
+    except ImportError:
+        warnings.warn('faiss unavailable, falling back to sklearn brute-force kNN')
+        idx = knn(vertices, vertices, n_neighbors=degree + 1, n_jobs=n_jobs).numpy()
+
+    # Drop self wherever it landed (ties can move it off rank 0) and left-compact,
+    # so every row keeps exactly `degree` real neighbours in ascending-distance order.
+    keep = idx != np.arange(num_vertices, dtype=idx.dtype)[:, None]
+    order = np.argsort(~keep, axis=1, kind='stable')[:, :degree]
+    idx = np.take_along_axis(idx, order, axis=1)
+    return {v: idx[v].tolist() for v in range(num_vertices)}
+
+
 class Graph:
     def __init__(self, vertices_path, edges_path,
                  train_queries_path, test_queries_path,
@@ -52,11 +131,13 @@ class Graph:
                  vertices_size=None, train_queries_size=None, 
                  val_queries_size=None, test_queries_size=None, 
                  ground_truth_n_neighbors=1, knn_n_jobs=1,
-                 initial_vertex_id=0, normalization='global', graph_type='nsw'):
+                 initial_vertex_id=0, normalization='global', graph_type='nsw',
+                 init_degree=24, init_seed=None, knn_cache_path=None):
         """
         Graph is a data class that stores all CONSTANT data about the graph: vertices, edges, etc.
         :param vertices_path: path to base datapoints
-        :param edges_path: path to initial graph edges
+        :param edges_path: path to initial graph edges. Ignored (and may be None)
+               for the 'random' and 'knn' graph types, which build s_0 themselves.
         :param train_queries_path: path to train queries
         :param test_queries_path: path to test queries
 
@@ -69,11 +150,21 @@ class Graph:
         :param knn_n_jobs: number of jobs used to precompute ground truth
         :param initial_vertex_id: starts search from this vertex
         :param normalization: normalization of base datapoints {'none', 'global', 'instance'}
-        :param graph_type: supported graph types: {'nsw', 'nsg'}.
+        :param graph_type: one of
+               'nsw'    -- read a pre-built NSW/HNSW graph from edges_path
+               'nsg'    -- read a pre-built NSG graph from edges_path
+               'random' -- uniformly random out-edges, built here
+               'knn'    -- exact kNN out-edges, built here
+        :param init_degree: out-degree for the 'random' and 'knn' graph types.
+               Every node gets exactly this many edges, which is also the degree
+               the graph-edit MDP's bounded swap then preserves.
+        :param init_seed: seed for the 'random' graph type (None = nondeterministic)
+        :param knn_cache_path: .npz cache for the 'knn' graph type's neighbour ids
         """
         self.graph_type = graph_type
         vertices = torch.tensor(read_fvecs(vertices_path, vertices_size))
         self.max_level = 0
+        built_types = ('random', 'knn')
         if graph_type == 'nsw':
             self.edges = read_edges(edges_path, vertices.shape[0])
             self.initial_vertex_id = initial_vertex_id
@@ -82,8 +173,14 @@ class Graph:
             info, self.edges = read_nsg(edges_path)
             self.initial_vertex_id = info['enterpoint_node']
             self.max_degree = info['width']
+        elif graph_type in built_types:
+            # Deferred until after normalization below: 'instance' normalization is
+            # not a monotone rescaling, so it can reorder nearest neighbours. Build
+            # kNN in the same space the search will actually run in.
+            self.initial_vertex_id = initial_vertex_id
+            self.max_degree = int(min(max(init_degree, 1), vertices.shape[0] - 1))
         else:
-            raise ValueError("Only ['nsw', 'nsg'] graph types are supported")
+            raise ValueError("Only ['nsw', 'nsg', 'random', 'knn'] graph types are supported")
 
         train_queries = torch.tensor(read_fvecs(train_queries_path, train_queries_size))
         test_queries = torch.tensor(read_fvecs(test_queries_path, test_queries_size))
@@ -102,6 +199,17 @@ class Graph:
 
         self.vertices, self.train_queries, self.test_queries = \
             map(normalize, [vertices, train_queries, test_queries])
+
+        if graph_type == 'random':
+            self.edges = build_random_edges(self.vertices.shape[0], self.max_degree,
+                                            seed=init_seed)
+            print('[graph] random s_0: {} nodes, out-degree {}'.format(
+                self.vertices.shape[0], self.max_degree))
+        elif graph_type == 'knn':
+            self.edges = build_knn_edges(self.vertices, self.max_degree,
+                                          cache_path=knn_cache_path, n_jobs=knn_n_jobs)
+            print('[graph] kNN s_0: {} nodes, out-degree {}'.format(
+                self.vertices.shape[0], self.max_degree))
 
         if train_gt_path is None:
             self.train_gt = knn(self.vertices, self.train_queries,

@@ -17,3 +17,7 @@ models/
 index/
 figure/
 TBG/
+
+# experiment logs
+logs/
+*.log

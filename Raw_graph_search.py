@@ -171,6 +171,7 @@ def run_cpp_search(vertices, edges, queries, gt, efs, k, initial_vertex_id,
                 initial_vertex_id,
                 ef,
                 n_jobs,
+                0,  # max_dcs: 0 = unlimited, this script measures the ef sweep
             )
             pred_chunks.append(results[:, :k].copy())
             dc_chunks.append(results[:, k].copy())
